@@ -1,0 +1,57 @@
+This focuses on the **Model Isolation** layer of your Defense-in-Depth architecture. In a G-SIB environment, isolation is critical to prevent "Model Contamination" (where one model accesses another's context) and "Tenant Leakage" (where User A's inference influences User B's session).
+
+### **Domain: Model & Runtime Isolation**
+
+**SC-AI-011: Hardware-Level GPU Partitioning (MIG)**
+* **Description:** To prevent side-channel attacks (e.g., memory timing, cache probing) between high-sensitivity models sharing the same GPU, strictly enforce **Multi-Instance GPU (MIG)** partitioning on NVIDIA hardware. Each model deployment must be pinned to a specific MIG instance (Compute Instance + GPU Memory Slice) rather than sharing the full GPU context.
+* **Threat(s) Mitigated:**
+    * **MITRE ATLAS AML.T0043 (Hardware Side Channel):** Prevents inference data leakage via shared VRAM.
+    * **OWASP LLM04:2024 (Resource Exhaustion):** Guarantees compute availability per model.
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Infrastructure Layer), NVIDIA Drivers.
+* **Implementation Guidance:** Configure the underlying Kubernetes/Orchestrator nodes to enable MIG mode on A100/H100 GPUs. Assign specific UUIDs for MIG instances to specific Model Serving Pods. **Do not** allow "Time-Slicing" (MPS) for models with different data classification levels (e.g., Retail Banking Model vs. Investment Banking Model).
+
+**SC-AI-012: Cryptographic Tenant Isolation (The "Key-Per-Tenant" Rule)**
+* **Description:** Logical separation (e.g., separate database rows) is insufficient for high-risk banking data. This control mandates **Application-Level Encryption (ALE)** where every tenant (or distinct business unit) has a unique encryption key. The Vector DB (`pgvector`) and Object Store (`MinIO`) store data encrypted with this tenant-specific key. Even if the Model Retrieval logic fails or suffers an SQL injection, the retrieved vectors are mathematically useless without the tenant's key.
+* **Threat(s) Mitigated:**
+    * **OWASP LLM06:2024 (Sensitive Info Disclosure):** Mitigates "Cross-Tenant Leakage."
+    * **MITRE ATLAS AML.T0025 (Data Leakage):** renders leaked vector dumps unreadable.
+* **Priority:** **Should-Have**
+* **Affected Component(s):** pgvector, MinIO, Key Management Service (KMS).
+* **Implementation Guidance:** Implement an "Encryption Sidecar" pattern. When `OpenTrek` requests a vector search, it passes the TenantID to the sidecar, which fetches the DEK (Data Encryption Key) to decrypt the *results* returned by `pgvector`. `pgvector` itself performs similarity search on *encrypted* vectors (if using HNSW with format-preserving encryption) or, more commonly, the metadata payload is encrypted while the vector index remains searchable but anonymized.
+
+**SC-AI-013: Ephemeral Inference Sandboxing (Runtime Seccomp/AppArmor)**
+* **Description:** Model serving containers (the actual Python processes running PyTorch/TensorFlow) are high-risk targets for Remote Code Execution (RCE). This control enforces a strict **Seccomp** profile and **Read-Only Root Filesystem** for all inference containers. The container should have zero network access to the public internet and restricted access to the internal network (only allowed to talk to the API Gateway and MinIO).
+* **Threat(s) Mitigated:**
+    * **OWASP LLM05:2024 (Supply Chain - Malicious Model):** Contains damage if a model executes malicious code.
+    * **MITRE ATLAS AML.T0024 (Command & Control):** Prevents the model container from phoning home.
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Runtime).
+* **Implementation Guidance:**
+    1.  **Network Policy:** Deny Egress `0.0.0.0/0`. Allow Egress only to `minio-svc` and `redis-svc` (on specific ports).
+    2.  **Security Context:** Set `readOnlyRootFilesystem: true`. Mount a strictly limited, ephemeral `/tmp` volume using `emptyDir` with a size limit (e.g., 512MB) to prevent disk-fill DoS.
+    3.  **Seccomp:** Profile must block `fork`, `execve` (except for the entrypoint), and `socket` calls that are not strictly necessary.
+
+**SC-AI-014: Vector Database Row-Level Security (RLS)**
+* **Description:** Leverage the native Row-Level Security features of PostgreSQL to enforce strict boundaries at the database kernel level. The application (OpenTrek) must connect to `pgvector` using a "Least Privilege" database user that *impersonates* the end-user or business unit context for that specific transaction.
+* **Threat(s) Mitigated:**
+    * **OWASP LLM02:2024 (Insecure Output Handling):** Prevents accidental retrieval of unauthorized context.
+* **Priority:** **Must-Have**
+* **Affected Component(s):** PostgreSQL (pgvector).
+* **Implementation Guidance:**
+    1.  Enable RLS on the `vectors` table: `ALTER TABLE document_embeddings ENABLE ROW LEVEL SECURITY;`
+    2.  Define Policy: `CREATE POLICY tenant_isolation ON document_embeddings USING (tenant_id = current_setting('app.current_tenant')::uuid);`
+    3.  In OpenTrek: For every RAG query, execute `SET LOCAL app.current_tenant = 'user_tenant_id';` before running the `SELECT` query.
+
+**SC-AI-015: Cache Namespace Segregation**
+* **Description:** Prevent "Cache Poisoning" where an attacker forces the LLM to cache a malicious response that is subsequently served to a victim user. `Redis` must be segmented so that users with different clearance levels (e.g., "Trader" vs. "Retail Admin") never share the same cache namespace.
+* **Threat(s) Mitigated:**
+    * **OWASP LLM07:2024 (Insecure Plugin Design):** Prevents cross-user data contamination.
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Redis.
+* **Implementation Guidance:**
+    * Use **Redis ACLs** to create distinct users for different model domains.
+    * **Key Design:** Prefix all cache keys with the hash of the user's *Access Policy ID*, not just the user ID. Example: `cache_key = SHA256(User_Policy_Hash + Prompt_Text)`. If a user's permissions change, the hash changes, effectively invalidating their access to old cached data.
+
+### **Next Step for You**
+Would you like me to diagram the **Secure Data Flow for RAG**, specifically highlighting where the **Encryption Keys** and **RLS Tokens** are injected during a user request?
