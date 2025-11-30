@@ -1,0 +1,98 @@
+This section details the **Secure Hosting Environment & Infrastructure Architecture**.
+
+ the hosting layer (Kubernetes, Linux, GPUs, Network) acts as the foundation. If the foundation is compromised (e.g., Kernel exploit, Container Escape), all upper-layer controls (Model Sanitization, Input Guardrails) are bypassed.
+
+### **Prioritized Secure Hosting Environment Controls**
+
+#### **SC-AI-080: Kubernetes Admission Controllers (Policy-as-Code)**
+* **Description:** A "Gatekeeper" that intercepts every request to the Kubernetes API server (e.g., "Deploy this Pod") and validates it against strict security policies. If a deployment violates a policy (e.g., requests `root` privileges, mounts the host filesystem, or uses the `:latest` tag), it is rejected before it ever reaches the scheduler.
+* **Description of the Threat:** **Misconfiguration & Privilege Escalation.** A developer accidentally deploys a container with `privileged: true`. An attacker compromises this container and immediately gains root access to the underlying physical server (Node), accessing all other models running on that hardware.
+* **Threat(s) Mitigated:**
+    * **OWASP:** Kubernetes Top 10 (Insecure Workload Configurations)
+    * **MITRE ATLAS:** AML.T0000 (Persistence / Privilege Escalation)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Kubernetes Control Plane
+* **Implementation Guidance:**
+    * **Tooling:** Deploy **OPA Gatekeeper** or **Kyverno**.
+    * **Policies:** Enforce the **Pod Security Standards (PSS) - Restricted** profile.
+        * `MustRunAsNonRoot: true`
+        * `AllowPrivilegeEscalation: false`
+        * `ReadOnlyRootFilesystem: true`
+
+#### **SC-AI-081: Runtime Threat Detection (eBPF Monitoring)**
+* **Description:** Continuous, deep-kernel monitoring of running containers using **eBPF** (Extended Berkeley Packet Filter). This detects "drift" from expected behavior. Since inference containers should be deterministic (receive prompt -> compute -> return answer), any unexpected syscall (e.g., spawning a shell `/bin/bash`, opening a network connection to an unknown IP, or modifying `/etc/passwd`) is flagged immediately.
+* **Description of the Threat:** **Zero-Day Exploit / Container Escape.** An attacker exploits a vulnerability in the `vLLM` web server. They get a shell. Standard logs won't show this immediately. eBPF sees the `execve()` syscall and alerts security ops in real-time.
+* **Threat(s) Mitigated:**
+    * **OWASP:** Kubernetes Top 10 (Insufficient Logging & Monitoring)
+    * **MITRE ATLAS:** AML.T0000 (Execution)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Kubernetes Nodes (Linux Kernel)
+* **Implementation Guidance:**
+    * **Tooling:** Deploy **Falco** or **Cilium Tetragon** as a DaemonSet.
+    * **Rules:**
+        * Alert on `spawn_shell` in any production pod.
+        * Alert on `write_below_etc` (modification of system files).
+        * Alert on `outbound_connection` to non-whitelisted IPs.
+
+#### **SC-AI-082: GPU Memory Scrubbing & IOMMU Protection**
+* **Description:** Controls to ensure that data left in the GPU High Bandwidth Memory (VRAM) is wiped between jobs, and that the GPU cannot access Host RAM via DMA (Direct Memory Access) attacks.
+* **Description of the Threat:** **Data Remanence.** Tenant A runs a batch inference job containing PII. Tenant B's job starts immediately after on the same GPU. If the VRAM wasn't zeroed, Tenant B could theoretically read the uninitialized memory and recover Tenant A's data.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+    * **MITRE ATLAS:** AML.T0025 (Data Leakage)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** NVIDIA Drivers / Kubernetes Device Plugin
+* **Implementation Guidance:**
+    * **NVIDIA Config:** Enable **ECC** (Error Correction Code) memory scrubbing.
+    * **MIG:** If using MIG (Multi-Instance GPU), the hardware enforces memory isolation physically.
+    * **IOMMU:** Enable `intel_iommu=on` in the Linux Grub config to prevent devices from reading arbitrary host memory.
+
+#### **SC-AI-083: Service Mesh mTLS & Zero-Trust Networking**
+* **Description:** Encrypt all East-West traffic (traffic between Pods) using Mutual TLS (mTLS). In a secure AI factory, the "Orchestrator" must prove its identity to the "Vector DB," and the "Vector DB" must prove its identity back. No unauthenticated traffic is allowed on the wire.
+* **Description of the Threat:** **Packet Sniffing / Lateral Movement.** An attacker compromises a logging agent on the node. They use `tcpdump` to sniff traffic on the container bridge network. Without mTLS, they capture the prompt text and vector embeddings in plain text as they travel between microservices.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+    * **MITRE ATLAS:** AML.T0000 (Credential Access)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Kubernetes Network (CNI)
+* **Implementation Guidance:**
+    * **Tooling:** Deploy **Istio** or **Linkerd**.
+    * **Policy:** Set `PeerAuthentication` to `STRICT` (mTLS required).
+    * **Authorization:** Use `AuthorizationPolicies` to whitelist service-to-service paths (e.g., Only `OpenTrek` can talk to `pgvector` on port 5432).
+
+#### **SC-AI-084: Strong Container Sandboxing (Kernel Isolation)**
+* **Description:** For high-risk components (specifically the **Ingestion Workers** that parse untrusted PDF/Docx files), use a stronger isolation boundary than standard Docker/Containerd. Use a user-space kernel or microVM.
+* **Description of the Threat:** **Kernel Panic / Escape.** The PDF parsing library (e.g., `libpoppler`) has a buffer overflow vulnerability. An uploaded resume exploits this to crash the host kernel or escape to the host. Standard containers share the host kernel, so a kernel panic takes down the whole node.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain - Vulnerable Dependencies)
+    * **MITRE ATLAS:** AML.T0000 (Impact - Denial of Service)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Ingestion/OCR Pods
+* **Implementation Guidance:**
+    * **Tooling:** Use **gVisor** (Google's user-space kernel) or **Kata Containers** (lightweight VMs).
+    * **Config:** In Kubernetes, create a RuntimeClass `gvisor` and assign untrusted parsing pods to use it: `runtimeClassName: gvisor`.
+
+#### **SC-AI-085: Confidential Computing (TEE / Enclaves)**
+* **Description:** *Advanced Control.* Using specialized hardware (e.g., Intel SGX/TDX, AMD SEV-SNP, or NVIDIA H100 Confidential Compute) to encrypt data *while it is being processed in RAM*. Even the Sysadmin or the Cloud Provider (if you were cloud) cannot dump the memory and see the data.
+* **Description of the Threat:** **Memory Dump / Cold Boot Attack.** An attacker with physical access to the server room (or root access to the OS) runs a memory dump tool to extract the decryption keys or the unencrypted model weights from RAM.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+    * **MITRE ATLAS:** AML.T0040 (ML Model Theft)
+* **Priority:** **Nice-to-Have** (Becomes "Must-Have" for extremely sensitive PII/IP)
+* **Affected Component(s):** Physical Hardware (CPU/GPU)
+* **Implementation Guidance:**
+    * **Hardware:** Purchase H100 GPUs with Confidential Compute enabled.
+    * **Software:** Use **SCONE** or **Gramine** wrappers to run the inference application inside the secure enclave.
+
+### **Summary of Hosting Security Strategy**
+
+
+
+| Layer | Control ID | Mechanism | Primary Goal |
+| :--- | :--- | :--- | :--- |
+| **Cluster** | **SC-AI-080** | **Admission Control** (OPA) | Prevent insecure configs from deploying. |
+| **Kernel** | **SC-AI-081** | **eBPF Monitoring** (Falco) | Detect runtime exploits/shells. |
+| **Kernel** | **SC-AI-084** | **Sandboxing** (gVisor) | Isolate risky parsers from Host OS. |
+| **Network** | **SC-AI-083** | **Service Mesh mTLS** | Encrypt traffic & enforce Zero Trust. |
+| **Hardware** | **SC-AI-082** | **IOMMU / ECC** | Prevent hardware-level memory leaks. |
+| **Hardware** | **SC-AI-085** | **Confidential Compute** | Protect data-in-use (RAM). |
