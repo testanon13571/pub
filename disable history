@@ -1,0 +1,81 @@
+This section details the **Data Retention & Ephemeral Processing Architecture**.
+
+ the safest data is the data you never store. By disabling prompt/response history, you convert the AI platform from a "System of Record" (which requires complex retention/deletion policies) into a "Stateless Processor" (like a calculator), significantly reducing your liability surface.
+
+### **Prioritized History Disablement Controls**
+
+#### **SC-AI-090: Zero-Retention Gateway Configuration**
+
+  * **Description:** Explicitly configure the **Alibaba OpenTrek** (or PAI-EAS) API Gateway and Load Balancers to disable "Request/Response Body Logging." While standard access logs (Metadata: IP, Time, Status Code) remain enabled for security monitoring, the *payloads* (Prompt Text, Generated Answers) must never be written to disk or shipped to the logging system (SLS).
+  * **Description of the Threat:** **Inadvertent Data Retention.** The platform team disables history in the application database, but the API Gateway defaults to "Debug" mode, logging every full HTTP payload to a text file on disk. An attacker (or auditor) finds millions of sensitive customer conversations in the web server logs, violating data minimization policies.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+      * **MITRE ATLAS:** AML.T0025 (Data Leakage - via Logs)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Alibaba OpenTrek (Gateway), Nginx/Ingress
+  * **Implementation Guidance:**
+      * **OpenTrek/PAI Config:** Set `logging.request_body = false` and `logging.response_body = false`.
+      * **Nginx:** Ensure `log_format` does not include `$request_body`.
+      * **Verification:** Grep the log files daily for 5 random prompts to prove they are absent.
+
+#### **SC-AI-091: Ephemeral "Volatile-LRU" Cache Strategy**
+
+  * **Description:** Configure **Redis** (used for conversation state) to operate in a purely ephemeral mode. Disable "Snapshotting" (RDB) and "Append Only File" (AOF) persistence features. Configure the eviction policy to aggressively remove old data. This ensures that if the server is powered down or seized, no history exists on the physical disk.
+  * **Description of the Threat:** **Forensic Data Recovery.** An attacker steals the physical disk or snapshot of the Redis server. If RDB persistence was enabled, they can reload the database and browse the last 30 days of "cached" user sessions.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+      * **MITRE ATLAS:** AML.T0000 (Remanence)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Redis
+  * **Implementation Guidance:**
+      * **Persistence:** Set `save ""` (empty string) in `redis.conf` to disable RDB. Set `appendonly no`.
+      * **Eviction:** Set `maxmemory-policy volatile-lru` (Evict keys with an expire set).
+      * **TTL:** Enforce a hard 1-hour TTL on all session keys: `SETEX session:123 3600 "..."`.
+
+#### **SC-AI-092: PostgreSQL Query Log Suppression**
+
+  * **Description:** Configure **PostgreSQL** (and **pgvector**) to prevent the logging of SQL parameters in the "Slow Query Log" or "Error Log." Vector searches often contain the raw embedding or even the raw text chunk in the query string. These must be masked or suppressed.
+  * **Description of the Threat:** **Leakage via Database Logs.** A user runs a query that crashes or is slow. PostgreSQL logs the full SQL statement to debug the error: `SELECT ... FROM embeddings WHERE text LIKE '%my_secret_password%'`. This writes the sensitive data to the generic database log.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** PostgreSQL / pgvector
+  * **Implementation Guidance:**
+      * **Parameter Hiding:** Set `log_error_verbosity = 'TERSE'` (hides details) or `log_parameter_max_length_on_error = 0`.
+      * **Statement Logging:** Ensure `log_statement = 'none'` or `ddl` (only log structural changes, not `SELECT/INSERT` data).
+      * **Extension:** For pgvector, ensure vector inputs are passed as bind parameters (`$1`), not raw string literals, to allow the database to redact them more easily if logging is needed for debugging.
+
+#### **SC-AI-093: Client-Side "Incognito" Flag Enforcement**
+
+  * **Description:** The frontend application must send a specific "No-Store" flag (e.g., `X-Privacy-Mode: true` or `store: false`) with every inference request. The Middleware (OpenTrek) must respect this flag by bypassing any "History Service" or "Analytics" modules.
+  * **Description of the Threat:** **UI/API Mismatch.** The user thinks they are in "Private Mode," but the backend default is "Save Everything." Without an explicit signal carried through the entire request chain, the backend acts on its default retention policy.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM02:2024 (Insecure Output Handling - Unwanted Retention)
+  * **Priority:** **Should-Have**
+  * **Affected Component(s):** Application Frontend, OpenTrek Orchestrator
+  * **Implementation Guidance:**
+      * **Header:** Define a standard header `X-Bank-Data-Retention: None`.
+      * **Middleware:** In the OpenTrek Python controller:
+        ```python
+        if request.headers.get('X-Bank-Data-Retention') == 'None':
+            skip_db_write = True
+            skip_analytics = True
+        ```
+
+### **Summary of History Disablement Strategy**
+
+| Layer | Component | Control ID | Mechanism | Result |
+| :--- | :--- | :--- | :--- | :--- |
+| **Gateway** | **OpenTrek** | **SC-AI-090** | **Disable Request/Response Logging** | No text in access logs. |
+| **Cache** | **Redis** | **SC-AI-091** | **Disable Persistence (RDB/AOF)** | RAM-only storage; data vanishes on reboot. |
+| **Database** | **PostgreSQL**| **SC-AI-092** | **Suppress Query Parameters** | No sensitive data in DB system logs. |
+| **App** | **Middleware**| **SC-AI-093** | **"No-Store" Header Logic** | Code bypasses "INSERT" into history tables. |
+
+### **Next Steps for You**
+
+This concludes the 94-control design suite.
+**Would you like me to:**
+
+1.  **Generate a downloadable CSV/Excel file** of this entire catalog for your GRC tool (Archer/ServiceNow)?
+2.  **Draft the "System Prompt"** specifically designed to support these security controls (e.g., the exact text for Citation enforcement and Negative Constraints)?
+3.  **Create a Mermaid Diagram** visualizing the specific "Ephemeral Data Flow" showing exactly where data is dropped?
