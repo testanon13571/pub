@@ -1,0 +1,106 @@
+This section details the **Data Anonymization & Privacy Architecture**.
+
+standard "Encryption at Rest" is insufficient because the AI model needs to *process* the data (calculate embeddings, generate text). This requires a strategy of **Pseudonymization** and **Granular Access Control** that protects data *while in use* without breaking the semantic relationships the model needs to understand.
+
+### **Prioritized Data Anonymization & Privacy Controls**
+
+#### **SC-AI-071: Format-Preserving Encryption (FPE) for Identifiers**
+
+  * **Description:** Encrypt sensitive structured identifiers (Credit Card Numbers, SSNs, Account IDs) in a way that preserves their original length and character set (e.g., a 16-digit card number encrypts to a different 16-digit number). This allows downstream banking applications and the RAG pipeline to validate formats without seeing real data.
+  * **Description of the Threat:** **Embedding Inversion & Leakage.** If you embed a raw Account ID into `pgvector`, an attacker who recovers the vector can invert it or simply retrieve the raw text chunk containing the ID. Standard encryption (AES) produces binary garbage that breaks text splitters and tokenizers; FPE keeps the data "readable" to the system but opaque to humans/models.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+      * **MITRE ATLAS:** AML.T0025 (Data Leakage)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Ingestion Pipeline (Python), PostgreSQL
+  * **Implementation Guidance:**
+      * **Tooling:** Use **Presidio Anonymizer** with an FPE operator or the **pyffx** (Python Format-Preserving Encryption) library in your ingestion script.
+      * **Method:**
+        1.  Detect Entity: `Account ID: 1234-5678`
+        2.  Encrypt: `pyffx.String(b'secret-key', alphabet='0123456789', length=8).encrypt('12345678')`
+        3.  Result: `Account ID: 9821-4421` (Safe to embed).
+
+#### **SC-AI-072: Vector-Level Row Security (RLS) Partitioning**
+
+  * **Description:** Enforce strict data segregation *inside* the vector database using PostgreSQL's native Row-Level Security (RLS). This ensures that even if the Model retrieves "Top 10 most relevant docs," it naturally excludes any vectors belonging to other business units or restricted clearance levels.
+  * **Description of the Threat:** **Cross-Tenant Data Leakage.** A "Private Wealth" banker asks the model "Who has the highest balance?" and the RAG system inadvertently retrieves a vector from the "Retail Banking" partition because it was semantically similar, violating Chinese Wall policies.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM07:2024 (Insecure Plugin Design / Access Control)
+      * **MITRE ATLAS:** AML.T0025 (Data Leakage)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** PostgreSQL / pgvector
+  * **Implementation Guidance:**
+      * **Schema:** Add a `tenant_id` or `access_group` column to your embeddings table.
+      * **Policy:**
+        ```sql
+        ALTER TABLE embeddings ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY tenant_isolation ON embeddings
+        USING (tenant_id = current_setting('app.current_tenant')::uuid);
+        ```
+      * **Runtime:** The OpenTrek API *must* set `SET app.current_tenant = 'user_group_id'` at the start of every transaction.
+
+#### **SC-AI-073: Field-Level Masking in Search Indices**
+
+  * **Description:** Configure Elasticsearch to hide or mask specific metadata fields (e.g., `author_email`, `client_name`) from the search results returned to the LLM, unless explicitly required. The LLM typically needs the *content* chunk, not the metadata of *who* wrote it.
+  * **Description of the Threat:** **Metadata Leakage.** The RAG system successfully filters the *document content*, but the metadata JSON returned by Elasticsearch includes `{"uploaded_by": "j.doe@bank.com", "salary_band": "Tier-1"}`. The LLM reads this metadata and leaks it in the answer.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+  * **Priority:** **Should-Have**
+  * **Affected Component(s):** Elasticsearch
+  * **Implementation Guidance:**
+      * **Field Level Security (FLS):** Define a role `rag_reader` in Elasticsearch.
+      * **Config:**
+        ```json
+        POST /_security/role/rag_reader
+        {
+          "indices": [
+            {
+              "names": [ "bank-docs-*" ],
+              "privileges": [ "read" ],
+              "field_security": {
+                "grant": [ "text_chunk", "doc_id", "public_title" ],
+                "except": [ "metadata.salary", "metadata.pii_*" ]
+              }
+            }
+          ]
+        }
+        ```
+
+#### **SC-AI-074: Differential Privacy for Synthetic RAG Generation**
+
+  * **Description:** *Advanced Control.* Instead of retrieving raw customer records, generate a "Synthetic" version of the sensitive dataset using Differential Privacy (DP) techniques. The RAG system queries this synthetic dataset, which statistically mirrors the real data but mathematically guarantees no single individual's data can be reverse-engineered.
+  * **Description of the Threat:** **Membership Inference Attack.** An attacker prompts the model with very specific details about a customer transaction to see if the model completes the sentence (confirming that specific customer is in the training/RAG set).
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+      * **MITRE ATLAS:** AML.T0026 (Membership Inference)
+  * **Priority:** **Nice-to-Have** (High maturity)
+  * **Affected Component(s):** Offline Data Pipeline
+  * **Implementation Guidance:**
+      * **Library:** Use **Google Differential Privacy (PyDP)** or **OpenDP**.
+      * **Process:** When ingesting "Transaction History" into RAG, do not index raw rows. Run the dataset through a DP-Synthesizer (adds Laplace noise to values) and index the *synthetic* rows.
+
+#### **SC-AI-075: Object-Level Encryption (WORM + KES)**
+
+  * **Description:** Encrypt every model artifact and RAG document *at rest* in MinIO using a unique key per object (or bucket), managed by an external KMS (Vault). Combine this with "Object Locking" (WORM) to prevents ransomware or accidental deletion.
+  * **Description of the Threat:** **Ransomware / Data Exfiltration.** An attacker gains access to the physical disk or the MinIO root credentials. Without KMS integration, they can simply copy the `model.safetensors` or `rag_documents` bucket. With SSE-KMS, they only get encrypted blobs and cannot access the external Vault to decrypt them.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** General Data Protection
+      * **MITRE ATLAS:** AML.T0040 (ML Model Theft)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** MinIO, HashiCorp Vault
+  * **Implementation Guidance:**
+      * **MinIO KES:** Deploy the **MinIO Key Encryption Service (KES)** as a gateway between MinIO and Vault.
+      * **Start Command:** `minio server --address ":9000" --kes-endpoint "https://kes:7373" --kes-key-name "rag-key"`
+      * **Locking:** Enable `Compliance` mode retention on the bucket: `mc retention set --mode compliance --validity 1y my-bucket`.
+
+### **Summary of Anonymization Strategy**
+
+[Image of Data Anonymization Flow Diagram]
+
+| Layer | Component | Control ID | Mechanism | Primary Goal |
+| :--- | :--- | :--- | :--- | :--- |
+| **Ingestion** | Pipeline | **SC-AI-071** | **FPE** (Format Preserving Encryption) | Keep IDs valid but secret. |
+| **Storage** | MinIO | **SC-AI-075** | **SSE-KMS + WORM** | Physical data theft prevention. |
+| **Database** | PostgreSQL | **SC-AI-072** | **Row-Level Security (RLS)** | Multi-tenant isolation. |
+| **Retrieval** | Elasticsearch| **SC-AI-073** | **Field-Level Security** | Hide PII metadata from LLM. |
+| **Generation**| Offline Job | **SC-AI-074** | **Differential Privacy** | Prevent statistical reverse-engineering. |
