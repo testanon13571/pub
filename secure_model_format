@@ -1,0 +1,65 @@
+This section details the **Secure Model Format & Serialization Architecture**.
+
+ the "Model File" (often a multi-gigabyte binary) is the primary vector for Supply Chain attacks. Traditional formats like Python `pickle` (used in `.bin`, `.pt`, `.pth`) are fundamentally insecure because they allow arbitrary code execution during loading. You must treat every external model file as "Untrusted Code" until it is sanitized and cryptographically signed.
+
+### **Prioritized Secure Model Format Controls**
+
+#### **SC-AI-086: Mandatory "Safe-by-Design" Format Enforcement**
+* **Description:** Strictly prohibit the deployment of `pickle`-based model formats (`.pkl`, `.bin`, `.pt`, `.pth`) in the production inference environment. Enforce a "Safe-Format-Only" policy that requires all models to be converted to **Safetensors** (`.safetensors`) or **ONNX** (`.onnx`) before they can be registered in the central artifact repository.
+* **Description of the Threat:** **Arbitrary Code Execution (ACE) via Deserialization.** The `torch.load()` function implicitly executes code embedded in a pickle file to reconstruct the Python object. An attacker can embed a "Reverse Shell" payload inside a legitimate-looking model file. When the inference server loads it, the payload executes, granting the attacker control over the GPU cluster.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Model Registry, Policy Enforcement Point
+* **Implementation Guidance:**
+    * **Policy:** Configure the Model Registry (e.g., MLflow, Artifactory) to reject uploads of files with unsafe extensions.
+    * **Runtime:** Hard-code the Inference Server (OpenTrek) loader to *only* accept `.safetensors` or `.onnx` paths.
+    * **Verification:** Use the `safetensors` library to verify the file header ensures it contains only tensor data and JSON metadata, no executable code.
+
+#### **SC-AI-087: Sandboxed "Quarantine & Transmute" Pipeline**
+* **Description:** A dedicated, isolated pipeline for ingesting external models. When a new model is downloaded (e.g., from Hugging Face), it lands in a "Quarantine" zone. A specialized "Transmutation Worker"—running in a highly restricted sandbox (no network, no root)—loads the unsafe pickle file and saves it as a secure Safetensors file.
+* **Description of the Threat:** **Zero-Day Exploit in Conversion.** The conversion process itself requires loading the unsafe file (triggering `torch.load`). If this is done on a developer's laptop or a shared CI runner, the malware executes *during conversion*, compromising that machine.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0000 (Persistence)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Ingestion Pipeline (Kubernetes Job)
+* **Implementation Guidance:**
+    * **Isolation:** Run the conversion script in a **gVisor** or **Kata Container** (microVM) to contain any potential kernel exploits or escapes.
+    * **Network:** Strictly block all outbound network access from the conversion pod (`allow_egress: none`).
+    * **Ephemeral:** Destroy the container immediately after the conversion is complete.
+
+#### **SC-AI-088: Deep Serialization Scanning (ModelScan)**
+* **Description:** Before the conversion process attempts to load a file, scan it with a specialized ML-security tool designed to parse the serialization graph without executing it. This tool looks for known dangerous operators (e.g., `os.system`, `subprocess.Popen`) and malicious signatures.
+* **Description of the Threat:** **Evasion of Basic Checks.** Standard antivirus tools often miss Python-specific payloads embedded in binary blobs. A "Sleep" attack might be embedded to wake up days later.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** CI/CD Pipeline
+* **Implementation Guidance:**
+    * **Tooling:** Implement **ModelScan** (ProtectAI) or **Gomboc** in the pipeline.
+    * **Configuration:** Fail the build if *any* unsafe operator is detected (Severity: Critical).
+    * **Note:** Do not rely solely on `picklescan` as it has known bypass vulnerabilities; use ModelScan for broader coverage.
+
+#### **SC-AI-089: Cryptographic Signing of Sanitized Artifacts**
+* **Description:** Once a model has been successfully sanitized (converted to Safetensors) and scanned, it must be cryptographically signed by the "Ingestion Service" using a private key stored in an HSM. This "Seal of Approval" proves that the model is safe and has passed all checks.
+* **Description of the Threat:** **Post-Scan Tampering.** An attacker cannot compromise the ingestion pipeline, so they wait until the file is in the Registry and then overwrite the "Safe" model with a "Malicious" one (with the same name). Without a signature, the inference server accepts the fake file.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** CI/CD, Model Registry
+* **Implementation Guidance:**
+    * **Tooling:** Use **Sigstore Cosign**.
+    * **Process:** `cosign sign-blob --key hsm://signing-key --tlog-upload=false model.safetensors`
+    * **Validation:** The production inference server verifies this signature before loading.
+
+### **Summary of Secure Model Format Strategy**
+
+| Phase | Control ID | Action | Tooling |
+| :--- | :--- | :--- | :--- |
+| **1. Ingest** | **SC-AI-088** | **Scan** raw pickle for malware. | **ModelScan** |
+| **2. Convert** | **SC-AI-087** | **Transmute** to Safetensors in Sandbox. | **gVisor** + `safetensors` lib |
+| **3. Sign** | **SC-AI-089** | **Sign** the safe artifact. | **Cosign** + HSM |
+| **4. Enforce** | **SC-AI-086** | **Block** unsafe formats in Prod. | **Policy Engine** (OPA) |
