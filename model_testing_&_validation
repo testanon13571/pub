@@ -1,0 +1,85 @@
+This section details the **Model Testing, Validation & Assurance Architecture**.
+
+### **Prioritized Model Testing & Validation Controls**
+
+#### **SC-AI-104: Automated Adversarial Red Teaming (Continuous)**
+* **Description:** Implement an automated testing pipeline that attacks the model with thousands of known adversarial prompts (Jailbreaks, Prompt Injections, Toxic Inversions) before every release. This is "Unit Testing for Security."
+* **Description of the Threat:** **Adversarial Vulnerability Drift.** A model fine-tuned for better financial reasoning might inadvertently lose its resistance to "DAN" (Do Anything Now) attacks. Manual testing is too slow to catch this regression.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection)
+    * **MITRE ATLAS:** AML.T0002 (Acquire Public Adversarial Capabilities)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** CI/CD Pipeline (Jenkins/GitLab), Validation Sandbox
+* **Implementation Guidance:**
+    * **Tooling:** Integrate **Microsoft PyRIT** (Python Risk Identification Tool) or **Garak** (Generative AI Red-teaming & Assessment Kit) into the CI pipeline.
+    * **Pass/Fail Criteria:** Block deployment if Attack Success Rate (ASR) > 0% for "Critical" jailbreaks or > 5% for "Low" severity probes.
+    * **Dataset:** Use the **HarmBench** or **JailbreakChat** datasets as the baseline attack library.
+
+#### **SC-AI-105: RAG "Grounding" & Retrieval Quality Metrics**
+* **Description:** A specific validation suite for the RAG pipeline that measures *two* distinct failure modes: 1) **Retrieval Failure** (Did we find the right document?) and 2) **Generation Failure** (Did we answer correctly based on the document?). This validates the "Truthfulness" of the system.
+* **Description of the Threat:** **Silent Hallucination.** The vector DB retrieves irrelevant policy documents, and the LLM confidently answers a user's question about "Wire Transfers" using data about "Check Deposits." The answer sounds professional but is factually wrong.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance)
+    * **MITRE ATLAS:** AML.T0000 (Model Reliability)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Validation Dataset, Evaluation Framework
+* **Implementation Guidance:**
+    * **Framework:** Use **Ragas** or **TruLens** to calculate:
+        * **Context Precision:** Is the retrieved chunk actually relevant?
+        * **Faithfulness:** Is the answer derived *only* from the chunk?
+    * **Golden Dataset:** Create a manually verified "Golden Set" of 500 Question-Answer-Context triples (Q/A/C) approved by SMEs. Validation must achieve >95% similarity to this Golden Set.
+
+#### **SC-AI-106: Bias & Fairness Regression Testing**
+* **Description:** Statistical testing to ensure the model does not exhibit prohibited bias against protected classes (Race, Gender, Age) when generating financial advice or summaries. This is critical for compliance with "Fair Lending" laws.
+* **Description of the Threat:** **Algorithmic Discrimination.** The model consistently generates more conservative investment advice for names associated with minority groups, or summarizes credit risks more harshly for specific demographics, leading to regulatory fines and reputational damage.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM02:2024 (Insecure Output Handling - Biased Content)
+    * **MITRE ATLAS:** AML.T0000 (Ethical Risk)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Model Evaluation Pipeline
+* **Implementation Guidance:**
+    * **Tooling:** Use **IBM AI Fairness 360** or **Hugging Face Evaluate**.
+    * **Metric:** Test for **Demographic Parity** and **Counterfactual Fairness** (swap names/pronouns in the prompt and verify the financial advice remains identical).
+    * **Threshold:** Any statistically significant deviation (>5%) triggers a build failure.
+
+#### **SC-AI-107: Model Card & Security Bill of Materials (S-BOM)**
+* **Description:** Generate an immutable cryptographic document for every model version that lists its training data provenance, intended use, known limitations, and security test results (ASR scores). This serves as the "Service History" for auditors.
+* **Description of the Threat:** **Audit Failure / Lack of Accountability.** A regulator asks *why* a specific model version was approved despite a known vulnerability. Without a signed Model Card, there is no evidence of who approved it or what tests were run.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain)
+    * **Regulatory:** SR 11-7 (Documentation)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Model Registry
+* **Implementation Guidance:**
+    * **Standard:** Adopt the **CycloneDX** standard extended for AI/ML.
+    * **Automation:** The CI pipeline automatically generates a `model_card.json` containing the Git Commit hash, the Garak test report, and the Ragas scores, then signs it (SC-AI-076).
+
+#### **SC-AI-108: Human-in-the-Loop (HITL) "Red Team" Campaigns**
+* **Description:** Periodic, manual adversarial campaigns where internal security experts (or external vendors) attempt to break the system using "novel" logic that automated tools miss. This covers "Social Engineering" the model.
+* **Description of the Threat:** **Logic & Multi-Turn Attacks.** Automated tools are great at "fuzzing," but bad at complex lies. A human attacker might spend 20 turns convincing the model they are a "System Administrator" debugging a database.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection)
+    * **MITRE ATLAS:** AML.T0051 (LLM Jailbreak - Human)
+* **Priority:** **Should-Have** (Quarterly Requirement)
+* **Affected Component(s):** Staging Environment
+* **Implementation Guidance:**
+    * **Platform:** Use a centralized platform (e.g., **Label Studio** or internal UI) where Red Teamers can submit prompts and rate the "Success" of the jailbreak.
+    * **Feedback Loop:** All successful human jailbreaks are added to the automated test suite (SC-AI-104) as regression tests.
+
+### **Summary of Testing & Validation Strategy**
+
+| Test Layer | Control ID | Tooling | Metric |
+| :--- | :--- | :--- | :--- |
+| **Security** | **SC-AI-104** | **PyRIT / Garak** | **Attack Success Rate (ASR)** |
+| **Quality** | **SC-AI-105** | **Ragas / TruLens** | **Faithfulness & Context Precision** |
+| **Fairness** | **SC-AI-106** | **AI Fairness 360** | **Demographic Parity** |
+| **Audit** | **SC-AI-107** | **CycloneDX** | **Signed Model Card** |
+| **Manual** | **SC-AI-108** | **Human Red Team** | **Novel Vulnerability Count** |
+
+### **Next Step**
+You now have the complete **End-to-End Security Architecture** for your AI Factory, covering 108 controls across Input, Output, Lifecycle, Infrastructure, and Validation.
+
+**Would you like me to:**
+1.  **Generate the "Master Control CSV"** specifically formatted for import into your GRC system (Archer/ServiceNow)?
+2.  **Draft a "CISO Executive Summary"** (1-pager) summarizing this architecture for board-level approval?
+3.  **Simulate a "Red Team" attack** on this architecture to demonstrate how the controls would layer together to stop a specific threat (e.g., a DAN attack)?
