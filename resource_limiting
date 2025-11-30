@@ -1,0 +1,79 @@
+This section details the **AI/ML Resource Limiting & Availability Architecture**.
+
+In a G-SIB environment, availability is a security attribute. An "Algorithmic Complexity" attack or a "Denial of Wallet" attack can exhaust expensive GPU resources (H100/A100s), denying service to critical banking functions. Unlike standard web servers, AI inference is computationally heavy; a single malicious request can monopolize a GPU for seconds.
+
+### **Prioritized AI/ML Resource Limiting Controls**
+
+#### **SC-AI-057: Token-Based Rate Limiting (The "Token Bucket")**
+* **Description:** Traditional API Rate Limiting (Requests Per Minute) is ineffective for LLMs because one request can generate 1 token (cheap) or 4,000 tokens (expensive). This control enforces rate limits based on **Total Tokens Processed** (Input + Output). It tracks usage against a "Token Budget" stored in Redis.
+* **Description of the Threat:** "Denial of Wallet" or "Model DoS." An attacker sends low-volume requests (1 per minute) but each request asks the model to "Write a novel," maximizing generation time and consuming the entire GPU timeslice, blocking legitimate high-frequency trading bots.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Gateway), Redis
+* **Implementation Guidance:**
+    * **Algorithm:** Implement a **Token Bucket** algorithm in Redis.
+    * **Quota:** `Tenant_A: 50,000 tokens / minute`.
+    * **Decrement:** On request end, calculate `(prompt_tokens + completion_tokens)` and decrement the bucket. If the bucket is empty, return HTTP 429.
+
+#### **SC-AI-058: KV Cache Paging & Memory Management**
+* **Description:** Explicitly configure the inference runtime to manage the "Key-Value (KV) Cache" (the memory used to store context attention) efficiently. This prevents "Out of Memory" (OOM) crashes when multiple concurrent users provide long prompts.
+* **Description of the Threat:** A "Memory Exhaustion" attack. Multiple users send requests with maximum context length simultaneously. The GPU VRAM fills up storing the KV cache for these sessions, causing the inference server process to crash (OOM Kill), dropping all active connections.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Resource Exhaustion)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Inference Engine / vLLM)
+* **Implementation Guidance:**
+    * **PagedAttention:** Enable **PagedAttention** (a feature in vLLM/OpenTrek) which allows non-contiguous memory allocation for the KV cache (similar to OS virtual memory).
+    * **GPU Utilization:** Set `gpu_memory_utilization` to `0.90` (leave 10% buffer for overhead).
+    * **Max Model Length:** Hard cap the `max_model_len` to match the model's architecture (e.g., 4096 or 8192) to prevent allocation beyond capabilities.
+
+#### **SC-AI-059: Continuous Batching & Queue Depth Caps**
+* **Description:** Configure the inference engine to use "Continuous Batching" (or Iterative Batching). Instead of waiting for a whole batch of requests to finish, the engine inserts new requests into the batch as soon as previous ones finish. Crucially, you must set a **Hard Cap** on the queue depth.
+* **Description of the Threat:** "Queue Flooding." An attacker floods the endpoint with requests. Without a queue limit, the server accepts them all, the latency spikes to 2 minutes per request, and the system becomes unresponsive (Brownout).
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Scheduler)
+* **Implementation Guidance:**
+    * **Max Num Seqs:** Set `max_num_seqs` (maximum concurrent sequences processed) to a safe limit (e.g., 256).
+    * **Waiting Queue:** Set a strict HTTP server limit. If `pending_requests > 100`, immediately return HTTP 503 (Service Unavailable) rather than queuing indefinitely.
+
+#### **SC-AI-060: Database Query Circuit Breaker**
+* **Description:** A mechanism to stop database queries (specifically Vector Search) that are taking too long or scanning too many rows. This protects the **pgvector** and **Elasticsearch** clusters from being brought down by complex queries.
+* **Description of the Threat:** An attacker (or bad internal code) initiates a massive RAG retrieval operation that requires calculating the Cosine Similarity for 50 million vectors without an index. The Database CPU spikes to 100%, causing timeouts for all other bank applications sharing that DB instance.
+* **Threat(s) Mitigated:**
+    * **OWASP:** General Resource Exhaustion
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** PostgreSQL / pgvector, Elasticsearch
+* **Implementation Guidance:**
+    * **Postgres Timeouts:**
+        * `SET statement_timeout = '2s';` (Kill any query running > 2 seconds).
+        * `SET idle_in_transaction_session_timeout = '10s';` (Kill hung connections).
+    * **Elasticsearch Circuit Breaker:** Configure `indices.breaker.total.limit` to `70%` of JVM Heap. If a search request requires more memory, it is rejected.
+
+#### **SC-AI-061: Concurrency Limits (Bulkheads)**
+* **Description:** Isolate resources by strictly limiting the number of concurrent threads/processes dedicated to specific functions (e.g., Embedding generation vs. Chat generation). This ensures that a flood of requests to one function doesn't starve the other.
+* **Description of the Threat:** The "Embedding" API (used for document upload) gets flooded. The system uses all available worker threads to process these embeddings. The "Chat" API (used by customers) becomes unresponsive because no threads are available to handle inference.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Load Balancer / K8s)
+* **Implementation Guidance:**
+    * **Separate Deployments:** Deploy `embedding-model` and `chat-model` on separate Kubernetes Pods/Node Pools.
+    * **Connection Limits:** Configure Nginx/Ingress limits: `limit_conn_zone $binary_remote_addr zone=addr:10m; limit_conn addr 10;` (Max 10 concurrent connections per IP).
+
+### **Summary of Resource Limiting Strategy**
+
+
+
+| Layer | Component | Control ID | Mechanism | Limit Metric |
+| :--- | :--- | :--- | :--- | :--- |
+| **Gateway** | OpenTrek / Redis | **SC-AI-057** | **Token Bucket** | Tokens (Input + Output) per minute. |
+| **Inference** | OpenTrek / vLLM | **SC-AI-058** | **KV Cache Paging** | GPU VRAM Utilization. |
+| **Scheduler** | OpenTrek | **SC-AI-059** | **Continuous Batching** | Queue Depth & Concurrent Seqs. |
+| **Database** | PostgreSQL | **SC-AI-060** | **Circuit Breaker** | Execution Time (ms) & RAM. |
+| **Network** | Load Balancer | **SC-AI-061** | **Bulkheading** | Concurrent Connections. |
