@@ -1,0 +1,80 @@
+This section details the **LLM Plugin & Tool Use Security Architecture**.
+
+In your "Serving & RAG" scope, "Plugins" (or Function Calling) are the mechanisms that allow the LLM to reach outside its context window to query a database, call an API, or perform a calculation. This is the **most dangerous** surface area of an AI system because it turns text generation into **action**.
+
+### **Prioritized LLM Plugin/Tool Security Controls**
+
+#### **SC-AI-047: Human-in-the-Loop (HITL) Approval for Sensitive Actions**
+* **Description:** A mandatory "Pause & Verify" gate. If an LLM plugin attempts to execute a "State-Changing" operation (POST, PUT, DELETE, or sending an email), the execution is suspended. The system presents the proposed action and parameters to the human user via the UI. The action proceeds *only* if the user explicitly confirms (clicks "Approve").
+* **Description of the Threat:** "Excessive Agency." The LLM hallucinates a command or gets tricked by a prompt injection to "Transfer funds to Account X." Without HITL, the API call happens instantly. With HITL, the user sees "I am about to transfer funds..." and denies it.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM08:2024 (Excessive Agency)
+    * **MITRE ATLAS:** AML.T0050 (Impact - Financial Theft / Data Destruction)
+* **Priority:** **Must-Have** (For any non-read-only tool)
+* **Affected Component(s):** Alibaba OpenTrek (Agent Orchestrator), UI Frontend
+* **Implementation Guidance:**
+    * **Classify Tools:** Tag every registered tool as either `SAFE` (Read-only, e.g., `search_docs`) or `SENSITIVE` (Write, e.g., `update_record`).
+    * **Orchestrator Logic:** `if tool.type == SENSITIVE: return AskUserConfirmation(tool.params)`
+
+#### **SC-AI-048: User Identity Propagation (On-Behalf-Of Flow)**
+* **Description:** The Plugin/Tool must **never** execute with the "System's" privileges (e.g., a super-admin API key). It must capture the authenticated user's JWT/Token and use that to authenticate against the downstream system (Database, API, Search).
+* **Description of the Threat:** "Confused Deputy." A Junior Analyst asks the LLM: "Show me the CEO's salary." The LLM calls the HR Plugin. If the Plugin uses a "Service Account" with broad access, it returns the data. If it uses the *User's* token, the downstream API returns "403 Forbidden," securing the data.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM07:2024 (Insecure Plugin Design), LLM06:2024 (Sensitive Info Disclosure)
+    * **MITRE ATLAS:** AML.T0025 (Data Leakage)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek, Downstream APIs
+* **Implementation Guidance:**
+    * **OIDC/OAuth:** Implement "Token Exchange" or "On-Behalf-Of" (OBO) flow.
+    * **Header Injection:** The Orchestrator passes `Authorization: Bearer <USER_TOKEN>` to the Tool/API, not the `SYSTEM_TOKEN`.
+
+#### **SC-AI-049: Strict Parameter Schema Validation (The "Shim" Layer)**
+* **Description:** Do not trust the LLM to generate valid code or SQL. Force the LLM to output structured data (JSON) for tool arguments, and validate that data against a strict **Pydantic/JSON Schema** *before* execution.
+* **Description of the Threat:** "Injection Attack." The tool expects a numeric ID. The LLM (via injection) outputs `1; DROP TABLE users`. If passed directly to a function or SQL query, this executes the attack.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM02:2024 (Insecure Output Handling - leading to Injection)
+    * **MITRE ATLAS:** AML.T0053 (Unintended Behavior)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Tool Executor)
+* **Implementation Guidance:**
+    * **Type Enforcement:** If the schema says `customer_id: UUID`, reject any string that isn't a valid UUID regex.
+    * **Length Enforcement:** Limit string parameters to reasonable maximums (e.g., `search_query` max 100 chars).
+    * **Allow-listing:** For categorical parameters (e.g., `region`), strictly enforce `Enum["US", "EU", "APAC"]`.
+
+#### **SC-AI-050: Server-Side Request Forgery (SSRF) Protection**
+* **Description:** If a plugin allows "Web Retrieval" or "API Calling" to arbitrary URLs, you must strictly control where it can connect. Block access to internal metadata services, loopback addresses (`localhost`, `127.0.0.1`), and private subnets.
+* **Description of the Threat:** An attacker asks the model: "Summarize the content at `http://169.254.169.254/latest/meta-data/iam/security-credentials/`." The model fetches this internal cloud metadata URL and displays the server's AWS/Alibaba keys to the user.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM07:2024 (Insecure Plugin Design)
+    * **MITRE ATLAS:** AML.T0000 (SSRF / Credential Theft)
+* **Priority:** **Must-Have** (If any URL-fetching tool exists)
+* **Affected Component(s):** Network Firewall, Application Proxy
+* **Implementation Guidance:**
+    * **Deny-List:** Block `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`.
+    * **Allow-List:** Only allow connections to specific, whitelisted domains (e.g., `*.bloomberg.com`, `*.reuters.com`).
+
+#### **SC-AI-051: Tool Execution Sandboxing (WASM/Containerization)**
+* **Description:** The code that actually runs the tool (e.g., the Python script that parses a CSV or calls an API) should not run in the same process as the Model Orchestrator. It should run in an ephemeral, isolated environment.
+* **Description of the Threat:** The LLM generates malicious Python code for a "Calculator" tool. This code executes `os.environ` and prints the orchestrator's environment variables (containing DB passwords).
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain / Remote Code Execution)
+    * **MITRE ATLAS:** AML.T0024 (Exfiltration via Code Execution)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Alibaba OpenTrek
+* **Implementation Guidance:**
+    * **WebAssembly (WASM):** Run tool logic in a WASM runtime (e.g., **Wasmtime**) which is memory-safe and isolated by default.
+    * **Ephemeral Containers:** Spin up a "Throwaway" Docker container for the specific tool execution, then destroy it immediately after the result is returned.
+
+---
+
+### **Summary of Plugin/Tool Security Strategy**
+
+
+
+| Control ID | Control Name | Mechanism | Primary Goal |
+| :--- | :--- | :--- | :--- |
+| **SC-AI-047** | **HITL Approval** | **Process Gate:** Pop-up confirmation for writes. | Prevent unintended actions/transactions. |
+| **SC-AI-048** | **Identity Propagation** | **Authentication:** Use User Token, not System Token. | Prevent privilege escalation (Confused Deputy). |
+| **SC-AI-049** | **Schema Validation** | **Validation:** Strict typing (Int, Enum, UUID). | Prevent Injection attacks via tool args. |
+| **SC-AI-050** | **SSRF Protection** | **Network:** Block internal IP/Metadata access. | Prevent network reconnaissance/credential theft. |
+| **SC-AI-051** | **Sandboxing** | **Isolation:** WASM or Ephemeral Containers. | Prevent RCE from compromising the host. |
