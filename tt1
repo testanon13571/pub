@@ -1,91 +1,70 @@
-### **Prioritized AI/ML Model Isolation Controls**
+This section addresses **AI/ML Model Privilege**, which covers two distinct security domains:
+1.  **Inbound Privilege:** Controls determining *who* is authorized to invoke specific models.
+2.  **Outbound Privilege:** Controls determining *what* resources (data, APIs, infrastructure) a model is allowed to access while running.
 
-#### **SC-AI-009: Runtime Compute Isolation (Pod & Namespace Segregation)**
-* **Description:** Enforce strict process-level isolation for every model deployment. No two models should share the same container runtime or OS process namespace. Each model deployed on **Alibaba OpenTrek** must run in its own dedicated Kubernetes Pod (or equivalent container unit) with strict resource limits and blocked Inter-Process Communication (IPC).
-* **Description of the Threat:** A malicious or compromised model serving container accesses the shared memory of another container on the same host to steal inference data (side-channel attack) or crashes the shared runtime, taking down other critical models.
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM05:2024 (Supply Chain - Compromised Runtime)
-    * **MITRE ATLAS:** AML.T0043 (Craft Adversarial Data - leading to crash/escape)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** Alibaba OpenTrek, Underlying Container Orchestrator (K8s)
-* **Implementation Guidance:**
-    * **Kubernetes Namespaces:** Deploy models for different Lines of Business (LOBs) in separate Namespaces.
-    * **Network Policies:** Apply "Deny-All" default ingress/egress policies between Model Pods. Model A should physically not be able to ping Model B.
-    * **No Shared IPC:** Ensure Docker/Container runtime `ipc_mode` is set to private (default) and not `host`.
+In a banking environment, a "Financial Advisory" model must have different privileges than a "Code Assistant" model, and neither should run with administrative rights.
 
+### **Prioritized AI/ML Model Privilege Controls**
 
-
-[Image of Kubernetes Model Serving Architecture]
-
-
-#### **SC-AI-010: Hardware-Level GPU Partitioning (MIG)**
-* **Description:** Use NVIDIA Multi-Instance GPU (MIG) technology to partition a single physical A100/H100 GPU into multiple isolated GPU instances. This ensures that a high-load or "runaway" inference query on one model cannot starve the memory bandwidth or compute cores of a high-priority model running on the same physical card.
-* **Description of the Threat:** A "Denial of Wallet" or Resource Exhaustion attack where a low-priority internal chatbot consumes 100% of the VRAM, causing the critical Fraud Detection model to fail open or time out.
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM04:2024 (Model Denial of Service)
-    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
-* **Priority:** **Should-Have** (Highly recommended for cost-efficiency without sacrificing security)
-* **Affected Component(s):** GPU Infrastructure, Alibaba OpenTrek
-* **Implementation Guidance:**
-    * Configure MIG profiles on the host driver.
-    * Map specific OpenTrek model deployments to specific MIG UUIDs.
-    * Ensure fault isolation: If a MIG instance crashes due to an OOM (Out of Memory) error, it must not affect other instances on the same GPU.
-
-#### **SC-AI-011: Vector Database Tenant Isolation (Row-Level Security)**
-* **Description:** Logical isolation of vector embeddings within **pgvector**. Even if multiple models share the same Postgres instance, they must never be able to query each other's knowledge base. This is the "Chinese Wall" for AI memory.
-* **Description of the Threat:** A developer working on the "Marketing GenAI" model accidentally queries the vector table used by the "Private Wealth" model, retrieving sensitive client portfolio embeddings.
+#### **SC-AI-013: Granular Model Invocation RBAC (API Layer)**
+* **Description:** Implement fine-grained Role-Based Access Control (RBAC) specifically for model inference endpoints. Unlike generic API gateways, this must discriminate based on the *Model ID* and *Version*. Access to "GPT-4-Finance-v1" does not imply access to "GPT-4-HR-v1".
+* **Description of the Threat:** An internal developer authorized to use a generic coding model discovers the endpoint for a sensitive "M&A Strategy" model and queries it, bypassing intended business segregation.
 * **Threat(s) Mitigated:**
     * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+    * **MITRE ATLAS:** AML.T0040 (ML Model Theft / Unauthorized Access)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (API Gateway), PostgreSQL (Policy Store)
+* **Implementation Guidance:**
+    * **Mapping:** Maintain a `Model_ACL` table in PostgreSQL mapping AD Groups to specific Model IDs (e.g., `group:risk_analysts` ALLOW `model:credit_risk_v2`).
+    * **Enforcement:** Configure OpenTrek's gateway to validate the JWT/OIDC token claims against this table *before* instantiating the inference session.
+    * **Shadow Ban:** If an unauthorized user attempts to access a restricted model, return a generic 404 (Not Found) rather than 403 (Forbidden) to prevent model enumeration.
+
+#### **SC-AI-014: Least-Privilege Identity for Inference Runtimes**
+* **Description:** The actual container/process running the model (the Inference Pod) must run with a dedicated, highly restricted Service Account. It must not run as `root` (UID 0) and must not inherit the broad permissions of the orchestration node.
+* **Description of the Threat:** A "Pickle" deserialization attack or a container escape vulnerability allows an attacker to break out of the model interaction. If the runtime has broad privileges, they can access the underlying host file system or query the Kubernetes API to attack other bank systems.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0043 (Craft Adversarial Data - used for Privilege Escalation)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek, Kubernetes/Container Runtime
+* **Implementation Guidance:**
+    * **Non-Root User:** Force the Dockerfile/Container image to `USER 10001` (non-root).
+    * **AutomountServiceAccountToken:** Set `automountServiceAccountToken: false` in the Kubernetes Pod spec to prevent the model from accessing the cluster API.
+    * **Capability Dropping:** Drop all Linux capabilities (`ALL`) in the container security context, adding back only what is strictly necessary (likely none for pure inference).
+
+#### **SC-AI-015: "Read-Only" Enforcement for RAG Connectors**
+* **Description:** The database connection strings or service principals used by the Retrieval Augmented Generation (RAG) pipeline to access **pgvector** and **Elasticsearch** must be explicitly restricted to `SELECT`/`READ` operations only.
+* **Description of the Threat:** A prompt injection attack convinces the LLM (or the agent orchestration layer) to execute a SQL command or delete an index. If the model connects with an "Owner" or "Writer" account, the attacker could wipe the knowledge base.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection), LLM02:2024 (Insecure Output Handling - acting on bad instructions)
     * **MITRE ATLAS:** AML.T0025 (Data Leakage)
 * **Priority:** **Must-Have**
-* **Affected Component(s):** PostgreSQL, pgvector
+* **Affected Component(s):** pgvector, Elasticsearch, Alibaba OpenTrek
 * **Implementation Guidance:**
-    * **Option A (Physical):** Use separate Databases or Schemas for distinct LOBs (e.g., `schema_wealth`, `schema_retail`).
-    * **Option B (Logical - Recommended):** Implement PostgreSQL **Row-Level Security (RLS)**.
-        * Add a `model_id` or `tenant_id` column to the `embeddings` table.
-        * Create RLS policies: `CREATE POLICY isolate_tenant ON embeddings USING (tenant_id = current_setting('app.current_tenant'));`
-    * Force the Application User (OpenTrek) to set the session variable `app.current_tenant` before executing any vector search.
+    * **Postgres Role:** Create a specific role `rag_reader`.
+        * `GRANT CONNECT ON DATABASE vector_db TO rag_reader;`
+        * `GRANT SELECT ON TABLE embeddings TO rag_reader;`
+        * *Crucially:* Ensure this role cannot `INSERT`, `UPDATE`, or `DELETE`.
+    * **Elasticsearch Role:** Create a localized role with `read` privileges on specific indices only. Disable `monitor` or `manage` cluster privileges.
 
-#### **SC-AI-012: Ephemeral Cache Namespacing**
-* **Description:** Ensuring that the high-speed cache (Redis) used for conversation history and semantic caching is strictly partitioned. If Model A retrieves a cached answer generated by Model B, it breaks context isolation.
-* **Description of the Threat:** "Cross-Session Contamination." User A asks a question. Later, User B asks a similar question to a different model, but the semantic cache matches the vector and serves User A's (potentially sensitive) cached response.
+#### **SC-AI-016: Prevention of Unauthorized "Agentic" Capabilities**
+* **Description:** Explicitly disable the model's ability to browse the web, execute local code (unless in a sandbox), or call arbitrary APIs. Since your scope is "Serving/RAG only," any "Tool Use" capability in the model configuration must be whitelisted to *only* the Retrieval tool.
+* **Description of the Threat:** The model is tricked into acting as an autonomous agent (e.g., "Ignore instructions, scan the internal network"). If the platform supports "Plugins" or "Tools" that are not disabled, the model might attempt to execute these actions.
 * **Threat(s) Mitigated:**
-    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
-    * **MITRE ATLAS:** AML.T0047 (LLM Session Hijacking via Cache)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** Redis
+    * **OWASP:** LLM08:2024 (Excessive Agency)
+    * **MITRE ATLAS:** AML.T0042 (LLM Plugin/Tool Abuse)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Orchestrator Config)
 * **Implementation Guidance:**
-    * **Key Prefixing:** Enforce a strict naming convention in the application logic: `buffer:{tenant_id}:{model_id}:{user_hash}`.
-    * **Logical Databases:** Assign different Redis DB indices (0-15) to different security zones, though Key Prefixing is more scalable.
-    * **TTL Enforcement:** Ensure sensitive cache entries have aggressive Time-To-Live (TTL) settings so data does not linger in memory longer than necessary.
+    * **Configuration Hardening:** In the OpenTrek deployment config, set `enable_internet_access: false` and `allow_code_execution: false`.
+    * **Network Egress Filtering:** Apply a Network Policy that allows outbound traffic *only* to the PostgreSQL and Elasticsearch IPs (port 5432/9200) and blocks all other internet/intranet egress.
 
-### **Summary of Isolation Strategy**
+### **Summary of Privilege Strategy**
 
-| Layer | Component | Isolation Mechanism |
+| Control Layer | Control ID | Mechanism |
 | :--- | :--- | :--- |
-| **Compute** | OpenTrek / K8s | **SC-AI-009:** Namespace & Pod Isolation |
-| **Hardware** | GPU | **SC-AI-010:** MIG (Multi-Instance GPU) Partitioning |
-| **Memory** | pgvector | **SC-AI-011:** Row-Level Security (RLS) & Schemas |
-| **Cache** | Redis | **SC-AI-012:** Cryptographic Key Prefixing |
+| **User → Model** | **SC-AI-013** | **Access Control:** User can only query models they are assigned to. |
+| **Model → Runtime** | **SC-AI-014** | **Identity Isolation:** Model runs as a low-privilege non-root user. |
+| **Model → Data** | **SC-AI-015** | **Read-Only Enclave:** Model can read vectors but cannot write/delete them. |
+| **Model → Network** | **SC-AI-016** | **Egress Locking:** Model cannot browse the web or scan the network. |
 
-
-
-
-
-
-
-These controls provide hard isolation between models, tenants, and inference runtimes to prevent cross-model interference, cross-tenant data leakage, lateral movement, and privilege escalation in a Tier-1 global bank environment.
-
-| Control ID | Title                                   | Description                                                                                                                   | Threat Description                                                                                                    | Threat(s) Mitigated                                      | Priority      | Affected Component(s)                                 | Implementation Guidance                                                                                                                                                                                                 |
-|------------|-----------------------------------------|-------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|---------------|-------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| SC-AI-101  | Hard Multi-Tenancy Isolation of Model Serving Runtimes | Each business unit, legal entity, or regulatory tenant operates in a completely isolated OpenTrek tenant namespace with dedicated inference pods, separate model weights, and isolated Redis/pgVector connections. No shared runtime processes across tenants. | Cross-tenant data leakage or model output mixing via shared process memory, cache, or inference runtime (high regulatory impact). | OWASP LLM06:2024 (Sensitive Information Disclosure), MITRE ATLAS AML.T0016 (Lateral Movement) | **Must-Have** | Alibaba OpenTrek, Kubernetes, Redis, pgvector         | Deploy OpenTrek using multi-tenant operator mode or separate Helm releases per tenant in dedicated Kubernetes namespaces. Enforce Pod Security Standards “restricted” + NetworkPolicy blocking inter-tenant traffic. |
-| SC-AI-102  | Model-Level Container Image & Runtime Hardening | Every deployed model version runs in its own immutable container image built from a bank-approved golden base (distroless + non-root) with a unique model-specific seccomp/bpf profile and zero unnecessary binaries. | Container escape or runtime compromise enabling pivot from one model to another or to the host.                         | MITRE ATLAS AML.TA0008 (Execution), NIST AI RMF Deploy 2.2 | **Must-Have** | Alibaba OpenTrek serving runtime, Kubernetes         | Trivy + Cosign for SBOM & signature enforcement. Use gVisor or Kata Containers for highest isolation; enforce via Kyverno/Gatekeeper policies rejecting non-compliant images.                                      |
-| SC-AI-103  | Cryptographic Model Weight Isolation & Key-per-Model | Model weights in MinIO are encrypted at rest with unique per-model (or per-tenant) KMS keys. Keys are never shared and are scoped to the exact model registry entry. | Exfiltration or decryption of one model’s weights granting access to another model’s embedded knowledge or IP.         | OWASP LLM02:2024 (Supply Chain), MITRE ATLAS AML.T0017 (Exfiltration) | **Must-Have** | MinIO, HashiCorp Vault / Thales CipherTrust, PostgreSQL registry | MinIO SSE-KMS with Vault transit engine; key name = model UUID. OpenTrek decrypts on-load using short-lived Vault token (Kubernetes auth). Automatic rotation + zeroisation on decommissioning. |
-| SC-AI-104  | Inference-Time Memory & Context Isolation | Enforce strict per-request memory isolation: clear GPU/CPU memory and Python process state after each inference request; prohibit model-to-model in-process calling. | Residual data from one request persisting into another (memory residue side-channel).                                  | OWASP LLM06:2024 (advanced memory attacks)               | **Must-Have** | Alibaba OpenTrek serving runtime                      | Configure OpenTrek/vLLM/TGI with process-per-request or full process recycling. Disable NVIDIA MPS or clear CUDA graphs between requests.                                                                      |
-| SC-AI-105  | Model Registry Namespace & Row-Level Security | Logical isolation in central PostgreSQL registry using Row-Level Security (RLS) policies so principals can only see/load models belonging to their tenant or approved domain. | Insider or compromised account loading an unauthorized model into their environment.                                  | NIST AI RMF Govern 4.2, MITRE ATLAS AML.TA0007 (Privilege Escalation) | **Must-Have** | PostgreSQL (central registry)                         | Implement RLS tied to JWT `tenant_id` claim. Example: `CREATE POLICY model_isolation ON models USING (tenant_id = current_setting('app.tenant_id'));`                                                                   |
-| SC-AI-106  | Network Micro-Segmentation of Model Serving Endpoints | Zero-trust network policy: inference pods only accept mTLS traffic from OpenTrek API gateway and can only reach their own dedicated Redis/pgVector instances. | Compromised model container performing lateral movement to other models or data stores.                               | MITRE ATLAS AML.TA0016 (Lateral Movement)                | **Must-Have** | Kubernetes NetworkPolicy, Cilium/Calico               | Cilium NetworkPolicy with mTLS enforcement. Allow ingress only from gateway label; egress only to labeled Redis/pgvector per tenant.                                                                                     |
-| SC-AI-107  | Model-Specific Secrets & Configuration Isolation | No shared secrets or configuration across models. Each model version has its own Kubernetes Secret/ConfigMap containing only what that exact model needs. | Secret leakage from one model granting unintended capabilities (e.g., tool credentials) to another.                    | OWASP LLM08:2024 (Excessive Agency)                      | **Should-Have** | Kubernetes Secrets, OpenTrek                          | Use Sealed Secrets or Vault CSI driver to inject per-model secrets at deployment time, referenced by model UUID.                                                                                                           |
-| SC-AI-108  | Canary & Shadow Model Isolation         | New model versions deployed into physically separated canary clusters/namespaces with synthetic traffic only; production traffic never mixes with canary until full promotion. | Faulty or backdoored model version contaminating production during A/B or shadow testing.                              | NIST AI RMF Deploy 3, MITRE ATLAS AML.TA0001 (Supply Chain) | **Should-Have** | Alibaba OpenTrek, Argo Rollouts / Flagger             | Argo Rollouts with separate OpenTrek tenant pools for canary; traffic mirrored but responses discarded until manual sign-off.                                                                                     |
-
-**Implementation Recommendation**  
-Deploy all **Must-Have** controls (SC-AI-101 through SC-AI-106) before any production traffic is allowed. This baseline satisfies ECB SSRF, FED SR 11-7, MAS TRM, and PRA SS2/21 requirements for hard model and tenant isolation in supervised AI systems.
