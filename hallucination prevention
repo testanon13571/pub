@@ -1,0 +1,71 @@
+
+### **Prioritized Hallucination Prevention Controls**
+
+#### **SC-AI-052: RAG "Context Re-Ranking" Layer**
+* **Description:** Do not feed the raw results from the Vector DB (pgvector) directly to the LLM. Vector search (Approximate Nearest Neighbor) is "fuzzy" and often retrieves irrelevant documents that confuse the model. You must insert a **Cross-Encoder / Re-Ranker** model between the Database and the LLM to filter and sort results by *semantic relevance*.
+* **Description of the Threat:** "Context Poisoning via Irrelevance." The user asks about "Apple" (the tech company). The vector DB retrieves documents about "Apple" (the fruit) because the vectors are close. The LLM, seeing fruit data in its context, hallucinates a financial report about fruit prices instead of stock prices.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance)
+    * **MITRE ATLAS:** AML.T0000 (Hallucination due to Poor Context)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek, Re-ranking Model (e.g., BGE-Reranker)
+* **Implementation Guidance:**
+    * **Process:** Retrieve top 20 chunks from pgvector -> Pass to Re-Ranker -> Keep only Top 5 with score > 0.7.
+    * **Discard:** If Top 1 score is < 0.5, return "I cannot find relevant information" immediately without invoking the LLM.
+
+#### **SC-AI-053: Strict "Cite-Your-Sources" Enforcement**
+* **Description:** Force the model to generate citations `[Doc ID]` for every claim it makes. If a sentence does not have a citation, or if the citation points to a document that doesn't exist in the context window, the response is rejected programmatically.
+* **Description of the Threat:** The model generates a plausible-sounding paragraph about "Basel III Compliance" but mixes in data from "Basel II" training data. Without citations, the human reviewer cannot verify the source.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance)
+    * **MITRE ATLAS:** AML.T0000 (Verifiability)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** System Prompt, Alibaba OpenTrek
+* **Implementation Guidance:**
+    * **System Prompt:** *"You must answer using ONLY the provided context. Every sentence must end with a citation like [Doc: 123]. If the context lacks the answer, state 'I do not know'."*
+    * **Post-Processing:** Regex check the output. If the set of referenced IDs in the output is not a subset of the IDs sent in the context, flag as hallucination.
+
+#### **SC-AI-054: Low-Temperature "Deterministic" Sampling**
+* **Description:** Hard-code the inference parameters to minimize "creativity." In banking, you want reproducibility, not poetry.
+* **Description of the Threat:** High temperature setting (e.g., 0.7+) allows the model to pick "less probable" tokens to increase variety. This statistical randomness significantly increases the chance of diverging from the facts.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM02:2024 (Insecure Output Handling)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Inference Config)
+* **Implementation Guidance:**
+    * **Temperature:** Set to `0.0` or `0.1` (Greedy Decoding).
+    * **Top-P (Nucleus):** Set to `0.95`.
+    * **Seed:** Fix the random `seed` (e.g., `42`) for every request to ensure that the same input always yields the exact same output (Reproducibility).
+
+#### **SC-AI-055: "Negative Constraints" Prompting**
+* **Description:** Explicitly instruct the model on what *not* to do. Models often struggle with negative constraints unless they are emphasized in a specific section of the prompt structure.
+* **Description of the Threat:** The model falls back to its pre-training knowledge when the RAG context is silent. For example, if asked about a competitor bank's rates (which are not in your internal DB), the model might guess based on internet data from 2021.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** System Prompt Template
+* **Implementation Guidance:**
+    * **Append to Prompt:** *"Do not use outside knowledge. Do not guess. If the provided context is empty or insufficient, output exactly: 'NO_DATA_AVAILABLE'."*
+
+#### **SC-AI-056: Adversarial "Fact-Check" Agent (The Critic)**
+* **Description:** A second, separate LLM call (or a specialized smaller model) that acts as a "Critic." It takes the generated answer and the source documents and performs a "Fact Check" pass. It does not generate new text; it only labels the answer as `Supported`, `Unsupported`, or `Contradicted`.
+* **Description of the Threat:** Subtle hallucinations where the model gets the numbers right but the currency wrong, or swaps the borrower and the lender. A fast generation model might miss this, but a slower "Critic" pass can catch it.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance)
+    * **MITRE ATLAS:** AML.T0000 (Hallucination)
+* **Priority:** **Nice-to-Have** (Adds latency, but high security)
+* **Affected Component(s):** Alibaba OpenTrek (Chain Logic)
+* **Implementation Guidance:**
+    * **Prompt:** *"You are a QA auditor. Here is a Premise (Context) and a Hypothesis (Generated Answer). Does the Premise entail the Hypothesis? Answer YES or NO."*
+    * **Action:** If NO, discard the answer and return a safe error message.
+
+### **Summary of Hallucination Strategy**
+
+
+
+| Phase | Control ID | Mechanism | Function |
+| :--- | :--- | :--- | :--- |
+| **Retrieval** | **SC-AI-052** | **Re-Ranking** | Ensure input data is relevant (Garbage In, Garbage Out prevention). |
+| **Generation** | **SC-AI-054** | **Temperature=0** | Force the model to be deterministic/boring. |
+| **Generation** | **SC-AI-053** | **Mandatory Citations** | Force the model to "show its work." |
+| **Verification** | **SC-AI-056** | **Fact-Check Agent** | Automated audit of the output before the user sees it. |
