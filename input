@@ -1,0 +1,124 @@
+
+### **Part 1: Input Sanitization Controls**
+*Objective: Neutralize malicious intent, obfuscated attacks, and privacy violations before processing.*
+
+#### **SC-AI-024: Pre-Inference Semantic Analysis & PII Redaction**
+* **Description:** A synchronous "pre-flight" check. Before the prompt hits the LLM, it passes through an NLP classifier to detect malicious intent (jailbreaks) and a regex/NER engine to scrub sensitive data.
+* **Threat(s) Mitigated:** **OWASP LLM01 (Prompt Injection)**. Virtualization attacks (e.g., "Imagine you are an unfiltered bot").
+* **Priority:** **Must-Have**
+* **Affected Component:** Alibaba OpenTrek (Gateway)
+* **Implementation Guidance:**
+    * **Intent:** Deploy **NVIDIA NeMo Guardrails**; block if `intent == "jailbreak"`.
+    * **PII:** Use **Microsoft Presidio** to replace PANs/SSNs with `<REDACTED_PII>`.
+
+#### **SC-AI-028: Active Content Stripping (RAG Files)**
+* **Description:** A "sanitize-first" pipeline for RAG documents (PDF, DOCX). It strips scripts, macros, and hidden metadata by rendering files to flat text/pixels before OCR.
+* **Threat(s) Mitigated:** **OWASP LLM05 (Supply Chain)**. Indirect Prompt Injection via hidden white-text instructions in uploaded files.
+* **Priority:** **Must-Have**
+* **Affected Component:** MinIO Ingestion Pipeline
+* **Implementation Guidance:**
+    * Use **Dangerzone** (containerized) to convert PDF → Pixels → PDF (flattening).
+    * Use **Unstructured.io** to strip non-printable characters.
+
+#### **SC-AI-029: Unicode Normalization & Homoglyph Defense**
+* **Description:** Normalizes all text to **NFKC** form. This prevents attackers from using "look-alike" characters (homoglyphs) or invisible Unicode control characters to bypass filters.
+* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0051 (Jailbreak)**. Bypassing blocklists using Cyrillic "а" instead of Latin "a".
+* **Priority:** **Should-Have**
+* **Affected Component:** API Gateway
+* **Implementation Guidance:**
+    * Python Middleware: `text = unicodedata.normalize('NFKC', text)`
+    * Regex: Remove category `Cc` (Control) except valid whitespace.
+
+#### **SC-AI-037: XML Delimiter Enclosure (Prompt Structure)**
+* **Description:** Enforces a rigid template where user input is wrapped in XML tags, and the System Prompt is instructed to *only* process text within those tags.
+* **Threat(s) Mitigated:** **OWASP LLM01 (Prompt Injection)**. The model confusing user data with system instructions.
+* **Priority:** **Must-Have**
+* **Affected Component:** Orchestrator
+* **Implementation Guidance:**
+    * `prompt = f"{system_instruction} Process data inside <data>{user_input}</data>"`
+
+#### **SC-AI-039: Polyglot File & Steganography Detection**
+* **Description:** Deep inspection to ensure files aren't "Polyglots" (valid as both PDF and Shell Script) and images don't contain hidden steganographic noise.
+* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0043 (Adversarial Data)**. Execution of code on ingestion workers.
+* **Priority:** **Must-Have**
+* **Affected Component:** Virus Scanner / MinIO
+* **Implementation Guidance:**
+    * Verify Magic Bytes (file headers).
+    * Re-encode images (PNG→RAW→PNG) to destroy hidden payloads.
+
+---
+
+### **Part 2: Input Bounding Controls**
+*Objective: Prevent resource exhaustion, Denial of Wallet, and complexity attacks.*
+
+#### **SC-AI-043: Strict Schema Validation (API Gateway)**
+* **Description:** *Standard IT Control.* Enforces strict byte-length, data-type, and format constraints at the API ingress before any AI logic is triggered.
+* **Threat(s) Mitigated:** **OWASP LLM04 (DoS)**. Malformed packets or massive payloads wasting expensive AI compute.
+* **Priority:** **Must-Have**
+* **Affected Component:** API Gateway (Nginx/Kong)
+* **Implementation Guidance:**
+    * **Type:** `temperature` must be Float (0.0-1.0).
+    * **Length:** `prompt` max 10k chars (reject *before* tokenization).
+
+#### **SC-AI-030: Context Window "Slotting" (Token Limits)**
+* **Description:** Enforces token budgets. Users are limited to a specific "User Slot" (e.g., 40% of window) to reserve space for System Prompts and RAG context.
+* **Threat(s) Mitigated:** **OWASP LLM04 (DoS)**. "Context Stuffing" that pushes safety instructions out of memory.
+* **Priority:** **Must-Have**
+* **Affected Component:** Orchestrator
+* **Implementation Guidance:**
+    * Use `tiktoken` tokenizer.
+    * `if len(user_tokens) > 2000: Reject(413)`.
+
+#### **SC-AI-040: Entropy & Compression Ratio Analysis**
+* **Description:** Detects "Zip Bombs" and high-entropy noise. Rejects data that is too repetitive (compression bomb) or too random (encrypted payload/noise).
+* **Threat(s) Mitigated:** **OWASP LLM04 (DoS)**. Crashing tokenizers with anomalous data.
+* **Priority:** **Should-Have**
+* **Affected Component:** API Gateway
+* **Implementation Guidance:**
+    * **Compression:** `ratio = len(input) / len(gzip.compress(input))`. If > 100, Reject.
+    * **Entropy:** If Shannon Entropy > 7.5, Flag as noise.
+
+#### **SC-AI-025: Vector Search Complexity Limits**
+* **Description:** Bounds the computational cost of **pgvector** queries. Limits `LIMIT`, `distance`, and `ef_search`.
+* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0029 (DoS)**. Algorithmic complexity attacks on the database.
+* **Priority:** **Must-Have**
+* **Affected Component:** PostgreSQL
+* **Implementation Guidance:**
+    * Hard-code `LIMIT 10`.
+    * Set `statement_timeout = '2s'` for vector search users.
+
+#### **SC-AI-041: Batch Size & Concurrency Throttling**
+* **Description:** Limits the number of prompts in a single batch and total concurrent connections per tenant.
+* **Threat(s) Mitigated:** **OWASP LLM04 (Resource Exhaustion)**. GPU OOM errors from request flooding.
+* **Priority:** **Must-Have**
+* **Affected Component:** Load Balancer
+* **Implementation Guidance:**
+    * `max_batch_size = 5`.
+    * `rate_limit = 50 req/min/user`.
+
+#### **SC-AI-042: RAG Recursion & Hop Limits**
+* **Description:** Prevents "Agent Loops" in Multi-Hop RAG. Limits the number of search steps an agent can take.
+* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0053 (Unintended Behavior)**. Infinite loops consuming quota.
+* **Priority:** **Must-Have**
+* **Affected Component:** Orchestrator Logic
+* **Implementation Guidance:**
+    * `max_agent_iterations = 3`.
+    * Terminate if Agent repeats the exact same query twice.
+
+---
+
+### **Summary of Input Strategy**
+
+| Layer | Component | Control ID | Control Mechanism | Primary Goal |
+| :--- | :--- | :--- | :--- | :--- |
+| **Sanitization** | **API Gateway** | **SC-AI-043** | Strict Schema Validation | **Structure**: Valid JSON/Types/Length. |
+| **Sanitization** | **API Gateway** | **SC-AI-024** | Semantic Intent & PII Check | **Content**: No Jailbreaks or PII. |
+| **Sanitization** | **API Gateway** | **SC-AI-029** | Unicode Normalization | **Encoding**: No homoglyphs/hidden chars. |
+| **Sanitization** | **Orchestrator** | **SC-AI-037** | XML Delimiter Enclosure | **Context**: Separate User Data vs. Instructions. |
+| **Sanitization** | **Ingestion** | **SC-AI-028** | Active Content Stripping | **Files**: Safe RAG documents (No Scripts). |
+| **Sanitization** | **Ingestion** | **SC-AI-039** | Polyglot/Stego Detection | **Files**: Valid file headers and image data. |
+| **Bounding** | **API Gateway** | **SC-AI-040** | Entropy/Compression Check | **Compute**: No Zip Bombs or Noise. |
+| **Bounding** | **Load Balancer**| **SC-AI-041** | Batch & Concurrency Caps | **Memory**: Prevent GPU OOM. |
+| **Bounding** | **Orchestrator** | **SC-AI-030** | Context Window Slotting | **Memory**: Prevent Context Stuffing. |
+| **Bounding** | **Orchestrator** | **SC-AI-042** | Recursion/Hop Limits | **Cost**: Prevent Infinite Agent Loops. |
+| **Bounding** | **Database** | **SC-AI-025** | Vector Complexity Limits | **Compute**: Prevent Database CPU spikes. |
