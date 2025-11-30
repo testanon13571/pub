@@ -1,0 +1,98 @@
+This section details the **Output Sanitization** and **Output Bounding** security architecture.
+
+While Input controls protect the *Model* from the *User*, Output controls protect the *User* (and downstream banking systems) from the *Model*. Even a frozen, safe model can hallucinate facts, leak RAG data, or generate malformed code that crashes downstream applications.
+
+### **Part 1: Output Sanitization Controls**
+*Objective: Ensure reliability, prevent data leakage, and filter toxic/hallucinated responses.*
+
+#### **SC-AI-026: RAG Entailment & Hallucination Detection**
+* **Description:** A post-processing "Grounding Check." Before the response is shown to the user, a lightweight "NLI" (Natural Language Inference) model compares the *Generated Answer* against the *Retrieved RAG Context*. It scores the response on "Faithfulness." If the model claims facts that are not present in the source documents, the response is flagged or blocked.
+* **Description of the Threat:** "Hallucination." A wealth management model confidently invents a new tax regulation that doesn't exist. If the banker relies on this (Overreliance), it leads to regulatory fines. Alternatively, the model mixes up data from two different clients.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance), LLM02:2024 (Insecure Output Handling)
+    * **MITRE ATLAS:** AML.T0000 (Generative AI Hallucination)
+* **Priority:** **Should-Have** (Critical for Advisory Models)
+* **Affected Component(s):** Alibaba OpenTrek (Post-Process Worker)
+* **Implementation Guidance:**
+    * **Entailment Model:** Deploy a small Cross-Encoder (e.g., DeBERTa-v3) locally.
+    * **Logic:** `score = model.predict(context, answer)`. If `score < 0.5` (Contradiction/Neutral), replace output with: "I cannot answer based strictly on the provided documents."
+
+#### **SC-AI-044: Output-Side PII Scrubbing (Defense-in-Depth)**
+* **Description:** A secondary PII scan applied to the *generated output*. Even if inputs were sanitized, the model might regurgitate sensitive training data (if not fully frozen/clean) or leak PII from RAG documents that wasn't properly filtered by the Vector DB ACLs. This is the "Safety Net."
+* **Description of the Threat:** The RAG system retrieves a document containing a client's IBAN. The LLM includes this IBAN in its summary. The user viewing the summary doesn't have clearance to see raw IBANs.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+    * **MITRE ATLAS:** AML.T0025 (Data Leakage)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Gateway Egress)
+* **Implementation Guidance:**
+    * **Re-use Presidio:** Apply the same **Microsoft Presidio** scanner used on Input (SC-AI-024) to the Output stream.
+    * **Regex Sentinel:** Hard-block specific patterns (e.g., regex for the bank's internal private keys or specific confidential project codenames).
+
+#### **SC-AI-045: "Refusal Leakage" & Meta-Prompt Filtering**
+* **Description:** Detects and blocks "Failed Refusals." Sometimes an LLM tries to refuse a harmful request but fails halfway, outputting: *"I cannot generate a phishing email, but here is a template that might look like one..."*. This control scans for these contradictory patterns.
+* **Description of the Threat:** A "Jailbreak" that partially succeeds. The model's safety training fights the user's prompt, resulting in a "leaky" refusal that still provides the harmful information or reveals its own System Prompt instructions.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection), LLM02:2024 (Insecure Output Handling)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek
+* **Implementation Guidance:**
+    * **Keyword Filter:** Block response if it contains both refusal language ("I cannot", "As an AI") AND content related to the forbidden topic.
+    * **System Prompt Guard:** Regex scan output for phrases like "You are a helpful assistant" or "My instructions are" (preventing System Prompt leakage).
+
+---
+
+### **Part 2: Output Bounding Controls**
+*Objective: Ensure structural integrity, prevent infinite loops, and limit downstream impact.*
+
+#### **SC-AI-027: JSON/XML Schema Enforcement (Grammar Sampling)**
+* **Description:** Forces the model to generate output that strictly adheres to a pre-defined schema (e.g., valid JSON). This is done not by "asking" the model, but by mathematically restricting the token sampling selection so that the model *cannot* output a token that would violate the schema.
+* **Description of the Threat:** A downstream banking application expects a JSON response: `{"risk": "High"}`. The model outputs: `Here is the JSON: {"risk": "High"}`. The extra text causes the downstream parser to crash or throws an error, breaking the automated workflow.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM02:2024 (Insecure Output Handling)
+    * **MITRE ATLAS:** AML.T0053 (Unintended Behavior)
+* **Priority:** **Must-Have** (For all Agent/API workloads)
+* **Affected Component(s):** Alibaba OpenTrek (Inference Engine)
+* **Implementation Guidance:**
+    * **Guided Generation:** Use libraries like **LMQL** or **Outlines**, or the native "Grammar" support in **vLLM** (often the backend for OpenTrek).
+    * **Schema Definition:** Pass the Pydantic model or JSON Schema to the inference engine.
+
+#### **SC-AI-021: Hard Token Limits & Stop Sequence Injection**
+* **Description:** Prevents "Runaway Generation" where the model gets stuck in a loop or generates excessive text. This enforces a hard ceiling on the `max_new_tokens` allowed per request and injects mandatory "Stop Sequences" that force the model to cease generation immediately.
+* **Description of the Threat:** A "Denial of Wallet" attack or a model bug where the LLM repeats a word infinitely ("and and and..."). This hogs the GPU, blocking other legitimate banking transactions and spiking compute costs.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Configuration)
+* **Implementation Guidance:**
+    * **Config:** Set `max_new_tokens=2048` (or lower for chat).
+    * **Stop Tokens:** Inject `["<|endoftext|>", "<eos>", "User:", "\n\nHuman:"]`.
+    * **Repetition Penalty:** Set `repetition_penalty=1.1` to statistically discourage looping.
+
+#### **SC-AI-046: Confidence Threshold Cutoff**
+* **Description:** If the model's internal confidence score (perplexity/log-probs) for a generated answer is below a certain threshold, the system automatically discards the answer and returns "I do not know."
+* **Description of the Threat:** The model is forced to answer a question it doesn't know (e.g., about a very obscure financial regulation). It "guesses" with low confidence, but the user treats it as fact.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance)
+    * **MITRE ATLAS:** AML.T0000 (Hallucination)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Alibaba OpenTrek
+* **Implementation Guidance:**
+    * **Log-Probs:** Request `logprobs` from the inference API.
+    * **Calculation:** If `average(logprobs) < -1.5` (indicative of low certainty), replace output with a fallback message.
+
+---
+
+### **Summary of Output Strategy**
+
+
+
+| Layer | Component | Control ID | Control Mechanism | Primary Goal |
+| :--- | :--- | :--- | :--- | :--- |
+| **Sanitization** | **Post-Process** | **SC-AI-026** | Hallucination/NLI Check | **Truthfulness**: Prevent lies. |
+| **Sanitization** | **Egress** | **SC-AI-044** | Output PII Scrubbing | **Privacy**: Catch leaked data. |
+| **Sanitization** | **Post-Process** | **SC-AI-045** | Refusal/Meta-Prompt Filter | **Safety**: Stop leaky refusals. |
+| **Bounding** | **Inference** | **SC-AI-027** | JSON Schema/Grammars | **Structure**: Valid, parsable data. |
+| **Bounding** | **Inference** | **SC-AI-021** | Token Limit & Stop Seq | **Resource**: Stop infinite loops. |
+| **Bounding** | **Inference** | **SC-AI-046** | Confidence Cutoff | **Quality**: Filter low-confidence guesses. |
