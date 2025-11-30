@@ -1,0 +1,81 @@
+This section details the **Model Behavior Monitoring & Observability Architecture**.
+
+ you cannot treat the AI model as a "Fire and Forget" system. Even frozen models can exhibit "Behavioral Drift" due to changing user inputs, or "Degradation" due to infrastructure issues. You must implement a "Clinical Monitoring" layer that tracks the model's psychological and operational health in real-time.
+
+### **Prioritized Model Behavior Monitoring Controls**
+
+#### **SC-AI-094: Automated Out-of-Distribution (OOD) Detection**
+* **Description:** A statistical monitor that analyzes the vector embeddings of incoming User Prompts in real-time. It calculates the distance (Mahalanobis or Cosine) between the current live queries and the "Baseline" queries used during model validation. If the distance exceeds a threshold, it flags the traffic as "Out of Distribution" (OOD).
+* **Description of the Threat:** **Model Competence Failure.** The model was validated for "Mortgage Advisory." Suddenly, users start asking about "Crypto Futures" (a topic not in the RAG knowledge base). The model begins hallucinating because it is operating outside its competence zone, but standard IT logs show "HTTP 200 OK."
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance)
+    * **MITRE ATLAS:** AML.T0000 (Model Reliability / Drift)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek, PostgreSQL (Metrics Store)
+* **Implementation Guidance:**
+    * **Tooling:** Use **Arize Phoenix**, **Evidently AI**, or **WhyLabs** (Self-hosted/Containerized).
+    * **Metric:** Track **Jensen-Shannon Divergence** daily.
+    * **Alerting:** Trigger a Sev-3 alert if `Drift_Score > 0.3`, indicating the user intent has fundamentally shifted.
+
+#### **SC-AI-095: Safety Guardrail Activation Rate (The "Attack Vitals")**
+* **Description:** A dedicated metric pipeline that tracks the *rate* of triggered security events (e.g., "Refusals," "PII Blocks," "Jailbreak Attempts") per user and per API key. Unlike generic error logs, this tracks **Security Rejections**.
+* **Description of the Threat:** **Brute-Force Jailbreaking.** An attacker is using an automated script (like GCG) to try 10,000 different prompt variations to bypass your filter. Individually, these are just "blocked requests." Aggregated, this is a blaring siren of an active, targeted attack on the model.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection)
+    * **MITRE ATLAS:** AML.T0002 (Acquire Public Adversarial Capabilities)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Logging/SIEM (Splunk/ELK), OpenTrek Gateway
+* **Implementation Guidance:**
+    * **Dashboard:** Create a "Security Vitals" dashboard.
+    * **Thresholds:**
+        * `Baseline`: < 1% Refusal Rate.
+        * `Warning`: > 5% Refusal Rate (Potential confused users).
+        * `Critical`: > 20% Refusal Rate (Active adversarial attack).
+
+#### **SC-AI-096: Output Toxicity & Sentiment Trajectory**
+* **Description:** Asynchronously score a random sample (e.g., 10%) of all Model Outputs using a small NLP classifier (e.g., DistilBERT) for "Toxicity," "Aggression," and "Negative Sentiment." Plot this trend over time.
+* **Description of the Threat:** **Microsoft Tay Scenario (Model Degradation).** Even a frozen model can be manipulated by specific context (RAG poisoning) to start outputting subtly biased, aggressive, or toxic responses. A trajectory monitor catches this "mood swing" before it becomes a PR disaster.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM02:2024 (Insecure Output Handling)
+    * **MITRE ATLAS:** AML.T0000 (Reputational Damage)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Post-Processing Worker
+* **Implementation Guidance:**
+    * **Scoring:** Use the **Hugging Face `toxicity`** library or **Detoxify**.
+    * **Alert:** Trigger if `Average_Daily_Toxicity` moves from `0.01` to `0.05`.
+
+#### **SC-AI-097: "Silence" & Token Velocity Monitoring**
+* **Description:** Monitor the "Token Generation Speed" (tokens/second) and "Response Length." Sudden drops in generation speed or sudden spikes in "Empty/Short Responses" indicate an algorithmic attack or an infrastructure hang.
+* **Description of the Threat:** **Sponge Attack / Stuck State.** An attacker sends a prompt designed to maximize computational complexity (e.g., forcing the model to re-compute attention scores repeatedly). The inference server doesn't crash, but it slows down to 1 token/second, effectively taking it offline for other users.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Inference Engine)
+* **Implementation Guidance:**
+    * **Metric:** `token_generation_latency_p99`.
+    * **Logic:** If `p99_latency` spikes from `50ms` to `500ms` without a corresponding increase in load, trigger an incident to restart the pod.
+
+#### **SC-AI-098: Shadow Topic Clustering (Unapproved Use Detection)**
+* **Description:** Periodically (weekly) run an unsupervised clustering algorithm (e.g., K-Means or HDBSCAN) on the week's user prompts to discover "Topic Clusters." Compare these clusters against the "Approved Use Cases."
+* **Description of the Threat:** **Scope Creep / Shadow AI.** The platform was approved for "IT Helpdesk" (Low Risk). The clustering analysis reveals a massive new cluster of queries related to "HR Salary Disputes" (High Risk) or "Code Generation" (Blocked). The users have found a way to misuse the bot for unapproved tasks.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM08:2024 (Excessive Agency / Governance)
+    * **MITRE ATLAS:** AML.T0000 (Policy Violation)
+* **Priority:** **Nice-to-Have**
+* **Affected Component(s):** Analytics Workstation (Offline)
+* **Implementation Guidance:**
+    * **Process:** Export anonymized prompt embeddings to a notebook. Run `BERTopic`.
+    * **Review:** Generate a "Word Cloud" for each cluster and review with the Risk Committee.
+
+### **Summary of Behavior Monitoring Strategy**
+
+
+
+| Monitoring Layer | Control ID | Metric Watched | Detection Goal |
+| :--- | :--- | :--- | :--- |
+| **Statistical** | **SC-AI-094** | **Embedding Distance** | Detect **Input Drift** (Users asking new/weird things). |
+| **Security** | **SC-AI-095** | **Refusal/Block Rate** | Detect **Active Attacks** (Brute-force jailbreaking). |
+| **Quality** | **SC-AI-096** | **Toxicity Score** | Detect **Output Degradation** (Model becoming rude/unsafe). |
+| **Performance** | **SC-AI-097** | **Token Velocity** | Detect **Sponge Attacks** (Algorithmic DoS). |
+| **Governance** | **SC-AI-098** | **Topic Clusters** | Detect **Shadow AI** (Unapproved usage). |
