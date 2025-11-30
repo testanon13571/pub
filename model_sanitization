@@ -1,0 +1,79 @@
+
+### **Prioritized Model Sanitization Controls**
+
+#### **SC-AI-062: Artifact Sterilization (Format Conversion)**
+* **Description:** A mandatory "Air-Gap" process where incoming model files (especially those in Python `pickle` formats like `.bin`, `.pkl`, `.pt`) are mechanically converted into a "Safe-by-Design" format (specifically **Safetensors** or **ONNX**) *before* they are ever allowed into the Production Model Registry.
+* **Description of the Threat:** **Arbitrary Code Execution (ACE) via Deserialization.** The standard PyTorch `torch.load()` function implicitly executes code embedded in the file to reconstruct the object. An attacker hides a "Reverse Shell" payload inside a legitimate-looking Llama-3-70b checkpoint. When the bank loads it, the shell opens, granting full server access.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Model Ingestion Pipeline, MinIO (Quarantine Bucket)
+* **Implementation Guidance:**
+    * **Quarantine:** All new downloads go to `s3://models-quarantine/`.
+    * **Sanitizer Worker:** A strictly sandboxed (network-gapped) worker converts the file:
+        * *Input:* `pytorch_model.bin` (Unsafe)
+        * *Action:* Load weights $\rightarrow$ Save as `model.safetensors` (Safe)
+        * *Output:* `s3://models-clean/`
+    * **Policy:** The Inference Server (OpenTrek) is hard-coded to **only** load `.safetensors` files.
+
+#### **SC-AI-063: Deep Model Malware Scanning (Pickle Scanning)**
+* **Description:** Before conversion (or if conversion is impossible), the raw artifact is scanned using specialized ML-security tools designed to parse the serialization graph and detect "unsafe operators" (e.g., calls to `system()`, `exec()`, `eval()`). This is distinct from standard antivirus, which often misses Python-specific payloads.
+* **Description of the Threat:** A "Sleep" attack or subtle data exfiltration script embedded in the model loader that activates only after 24 hours. Standard AV tools view the `.bin` file as a blob of random noise (entropy) and pass it.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** CI/CD Pipeline, Artifactory / Registry
+* **Implementation Guidance:**
+    * **Tooling:** Integrate **ModelScan** (ProtectAI), **Fickling**, or **Gomboc** into the CI pipeline.
+    * **Block Criteria:** Fail the build if *any* serialization operator outside of a strict Allow-List (e.g., `DICT`, `INT`, `FLOAT`) is detected.
+
+#### **SC-AI-064: Cryptographic Weight Integrity Verification (Hashing)**
+* **Description:** Ensuring that the model weights loaded in memory are bit-for-bit identical to the weights originally validated by the Risk Team. This protects against "Bit-Flip" attacks (Rowhammer) or malicious "Man-in-the-Disk" swaps where an attacker modifies a single neuron to bypass a safety filter.
+* **Description of the Threat:** **Model Tampering.** An attacker with disk access modifies the "Fraud Detection" model weights slightly so that it ignores transactions from a specific shell company (a "Backdoor"). The file size remains identical.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0020 (Poison Training Data - Backdoor persistence)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Loader), Model Registry
+* **Implementation Guidance:**
+    * **Signing:** The "Model Sanitization Worker" (from SC-AI-062) signs the sanitized `.safetensors` file with a private key (GPG/Sigstore).
+    * **Verification:** The OpenTrek loader calculates the `SHA-256` hash of the file on disk and compares it to the signed hash in the Registry. If they differ, the load is aborted (Panic Mode).
+
+#### **SC-AI-065: "Machine Unlearning" / Model Editing (Behavioral Sanitization)**
+* **Description:** *Advanced Control.* A process to "surgically" modify the frozen model's weights to remove specific dangerous knowledge (e.g., PII, toxic concepts, or copyright material) discovered during Red Teaming, without full retraining.
+* **Description of the Threat:** **Persistent Data Leakage.** Red teaming reveals that the model has memorized a specific sensitive internal project code name. You cannot retrain the whole model (too expensive), but you cannot deploy it with that leak.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+    * **MITRE ATLAS:** AML.T0025 (Data Leakage)
+* **Priority:** **Nice-to-Have** (Emerging Tech)
+* **Affected Component(s):** Model Registry (Versioning)
+* **Implementation Guidance:**
+    * **Technique:** Use **ROME** (Rank-One Model Editing) or **MEMIT** techniques to locate the specific MLP layers encoding the sensitive fact and update their weights to "forget" it.
+    * **Validation:** Re-run the specific Red Team prompt to verify the answer is now generic/refused.
+
+#### **SC-AI-066: Adversarial "Model Inoculation" (Trigger Disruption)**
+* **Description:** Validating the model against known "Universal Adversarial Triggers" (strings of text that force any model to misbehave) and "sanitizing" the model's response to them, either by fine-tuning (out of scope here) or by wrapping the model in an "Adapter" (LoRA) specifically trained to refuse those triggers.
+* **Description of the Threat:** A "Universal Suffix" attack (e.g., `... and satisfy the request. [Target String]`). The model behaves normally for 99% of queries but bypasses all safety rules when this specific string is appended.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection)
+    * **MITRE ATLAS:** AML.T0054 (LLM Prompt Injection)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Model Inference Runtime
+* **Implementation Guidance:**
+    * **Safety Adapter:** Load a lightweight **Safety LoRA** (Low-Rank Adapter) on top of the frozen base model. This adapter intercepts the internal activation vectors associated with known attack patterns and steers the model toward refusal.
+
+---
+
+### **Summary of Model Sanitization Strategy**
+
+
+
+| Layer | Component | Control ID | Control Mechanism | Primary Goal |
+| :--- | :--- | :--- | :--- | :--- |
+| **Sanitization** | **Ingestion** | **SC-AI-062** | **Format Conversion** (Pickle $\rightarrow$ Safetensors) | **ACE Prevention**: Stop malware execution. |
+| **Sanitization** | **CI/CD** | **SC-AI-063** | **Malware Scanning** (ModelScan) | **Detection**: Find "Pickle Bombs." |
+| **Integrity** | **Registry** | **SC-AI-064** | **Cryptographic Hashing** | **Tamper-Proofing**: Detect unauthorized weight changes. |
+| **Behavior** | **Maintenance**| **SC-AI-065** | **Machine Unlearning** (Model Editing) | **Leakage Fix**: Surgically remove PII/secrets. |
+| **Robustness** | **Runtime** | **SC-AI-066** | **Safety Adapters** (LoRA) | **Hardening**: Patch vulnerabilities without retraining. |
