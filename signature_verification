@@ -1,0 +1,75 @@
+This section details the **Model Signature & Integrity Verification** architecture.
+
+ standard "checksums" (MD5/SHA) are insufficient because they prove only *consistency*, not *authenticity*. You must implement cryptographic signatures that prove **who** trained the model (Provenance) and that it has not been modified since approval (Integrity), backed by hardware-grade key protection.
+
+### **Prioritized Signature Verification Controls**
+
+#### **SC-AI-076: Cryptographic Model Signing (Sigstore/Cosign)**
+
+  * **Description:** Implement a "detached signature" mechanism for all model artifacts (`.safetensors`, `.onnx`) using an industry-standard signing tool like **Sigstore Cosign** or **GPG**. The signature must be generated using a private key held in an HSM and verified against a public key baked into the inference container image.
+  * **Description of the Threat:** **Supply Chain Compromise.** An attacker compromises the MinIO bucket or the Artifactory repo and replaces the "Credit Risk v1" model with a "Credit Risk v1 (Backdoored)" file. Since the file size and name are identical, the system loads the malware.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+      * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** CI/CD Pipeline, Model Registry, OpenTrek Loader
+  * **Implementation Guidance:**
+      * **Signing:** `cosign sign-blob --key hsm://my-key model.safetensors --output-signature model.sig`
+      * **Verification:** Before loading, run: `cosign verify-blob --key public.key --signature model.sig model.safetensors`
+      * **Policy:** Configure the OpenTrek runtime to **crash** if verification fails.
+
+#### **SC-AI-077: TOCTOU-Proof Atomic Loading**
+
+  * **Description:** Mitigate "Time-of-Check to Time-of-Use" (TOCTOU) race conditions. A common vulnerability occurs when a system verifies a file's signature on disk, but an attacker swaps the file in the split second *after* verification but *before* the Python loader reads it into memory.
+  * **Description of the Threat:** **Race Condition Swapping.** An attacker with shell access monitors the validation process. As soon as the `verify_signature()` function passes, they overwrite the `.safetensors` file with a malicious version before `torch.load()` executes.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+      * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Custom Python Loader / Inference Server
+  * **Implementation Guidance:**
+      * **Method A (Memory-First):** Read the *entire* file into RAM buffer first. Hash/Verify the buffer. Load the model from the *buffer* (using `io.BytesIO`). This ensures the verified bytes are exactly the used bytes.
+      * **Method B (File Locking):** Use OS-level file locks (`fcntl.flock`) on the model file during the verify-then-load sequence.
+
+#### **SC-AI-078: Hardware-Backed Key Storage (HSM)**
+
+  * **Description:** The Private Keys used to sign production models must never exist on a developer laptop or a CI runner's ephemeral filesystem. They must be generated and stored inside a FIPS 140-2 Level 2 (or higher) **Hardware Security Module (HSM)**.
+  * **Description of the Threat:** **Key Theft.** An attacker compromises a Senior Data Scientist's laptop and steals the `private_key.pem`. They can now sign *any* malicious model as "Bank Approved," and the inference servers will trust it blindly.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** HashiCorp Vault / Cloud HSM
+  * **Implementation Guidance:**
+      * **Generation:** Keys are generated *inside* the HSM.
+      * **Usage:** The CI/CD pipeline authenticates to the HSM and requests a signing operation. The key never leaves the hardware boundary.
+
+#### **SC-AI-079: Manifest & Metadata Binding**
+
+  * **Description:** Do not sign just the model weights (blob). Sign a **Manifest** (BOM) that includes the hash of the weights, the hash of the configuration file (`config.json`), the tokenizer vocabulary, and the training dataset ID.
+  * **Description of the Threat:** **Configuration Drift / Mix-and-Match Attack.** An attacker cannot modify the weights, so they modify the `config.json` to change the `eos_token_id` (End of Sequence) to something random. The model loads (signature valid for weights), but it now generates infinite garbage text because it doesn't know when to stop.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+      * **MITRE ATLAS:** AML.T0043 (Craft Adversarial Data - via Config)
+  * **Priority:** **Should-Have**
+  * **Affected Component(s):** Model Registry
+  * **Implementation Guidance:**
+      * Create a `manifest.json`:
+        ```json
+        {
+          "model_sha256": "a1b2...",
+          "config_sha256": "c3d4...",
+          "tokenizer_sha256": "e5f6...",
+          "approved_by": "Risk_Committee_ID"
+        }
+        ```
+      * Sign the `manifest.json`.
+      * Verify the manifest signature, then verify the hashes of all referenced files match the manifest.
+
+### **Summary of Signature Strategy**
+
+| Component | Control ID | Mechanism |
+| :--- | :--- | :--- |
+| **Artifact** | **SC-AI-076** | **Cosign/Sigstore** (Detached Signatures) |
+| **Runtime** | **SC-AI-077** | **In-Memory Verification** (TOCTOU Prevention) |
+| **Secrets** | **SC-AI-078** | **HSM Storage** (Key Protection) |
+| **Metadata** | **SC-AI-079** | **Manifest Signing** (Config Integrity) |
