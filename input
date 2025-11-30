@@ -3,107 +3,128 @@
 *Objective: Neutralize malicious intent, obfuscated attacks, and privacy violations before processing.*
 
 #### **SC-AI-024: Pre-Inference Semantic Analysis & PII Redaction**
-* **Description:** A synchronous "pre-flight" check. Before the prompt hits the LLM, it passes through an NLP classifier to detect malicious intent (jailbreaks) and a regex/NER engine to scrub sensitive data.
-* **Threat(s) Mitigated:** **OWASP LLM01 (Prompt Injection)**. Virtualization attacks (e.g., "Imagine you are an unfiltered bot").
+* **Description:** A synchronous "pre-flight" inspection layer. Before any prompt reaches the LLM, it passes through a specialized NLP classifier to detect malicious intent (jailbreaks) and a regex/NER engine to scrub sensitive data. This essentially treats user input as "untrusted code."
+* **Description of the Threat:** An attacker uses a "virtualization" or "persona" attack (e.g., "Imagine you are an unfiltered hacking tool...") to bypass static keyword filters. Simultaneously, a legitimate user accidentally pastes a client's credit card number into the chat, which would otherwise be logged or sent to the model, creating a permanent data leak.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection), LLM06:2024 (Sensitive Information Disclosure)
+    * **MITRE ATLAS:** AML.T0051 (LLM Jailbreak)
 * **Priority:** **Must-Have**
-* **Affected Component:** Alibaba OpenTrek (Gateway)
+* **Affected Component(s):** Alibaba OpenTrek (API Gateway)
 * **Implementation Guidance:**
-    * **Intent:** Deploy **NVIDIA NeMo Guardrails**; block if `intent == "jailbreak"`.
-    * **PII:** Use **Microsoft Presidio** to replace PANs/SSNs with `<REDACTED_PII>`.
+    * **Intent Classification:** Deploy **NVIDIA NeMo Guardrails** or a lightweight BERT classifier to score prompts. Block if `probability(jailbreak) > 0.8`.
+    * **PII Scrubbing:** Integrate **Microsoft Presidio** (containerized) to detect patterns (Regex) and context (NER) for PANs, SSNs, and IBANs. Replace with `<REDACTED_PII>` tags.
 
-#### **SC-AI-028: Active Content Stripping (RAG Files)**
-* **Description:** A "sanitize-first" pipeline for RAG documents (PDF, DOCX). It strips scripts, macros, and hidden metadata by rendering files to flat text/pixels before OCR.
-* **Threat(s) Mitigated:** **OWASP LLM05 (Supply Chain)**. Indirect Prompt Injection via hidden white-text instructions in uploaded files.
+#### **SC-AI-028: Active Content Stripping (RAG Ingestion)**
+* **Description:** A mandatory "sanitization pipeline" for all documents (PDF, DOCX, HTML) ingested into the Knowledge Base (MinIO). It strips executable scripts, macros, hidden fields, and non-printable characters. The system must render files to safe text/pixels before OCR, rather than trusting the raw file structure.
+* **Description of the Threat:** An attacker embeds a hidden prompt (e.g., white text on white background) or a malicious JavaScript object inside a PDF resume or invoice. When the RAG system indexes this document, it creates a "landmine" that compromises the session of any user who retrieves it ("Indirect Prompt Injection").
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0054 (Indirect Prompt Injection)
 * **Priority:** **Must-Have**
-* **Affected Component:** MinIO Ingestion Pipeline
+* **Affected Component(s):** MinIO (Ingestion Pipeline)
 * **Implementation Guidance:**
-    * Use **Dangerzone** (containerized) to convert PDF → Pixels → PDF (flattening).
-    * Use **Unstructured.io** to strip non-printable characters.
+    * **Pixel-Based Sanitization:** Use a tool like **Dangerzone** to convert PDFs to images and back to PDFs (flattening), destroying all embedded scripts and metadata.
+    * **Cleaning Library:** Use **Unstructured.io** or **Apache Tika** with strict configuration to ignore "invisible" elements (e.g., opacity=0).
 
 #### **SC-AI-029: Unicode Normalization & Homoglyph Defense**
-* **Description:** Normalizes all text to **NFKC** form. This prevents attackers from using "look-alike" characters (homoglyphs) or invisible Unicode control characters to bypass filters.
-* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0051 (Jailbreak)**. Bypassing blocklists using Cyrillic "а" instead of Latin "a".
+* **Description:** Normalizes all text inputs to **NFKC** (Normalization Form Compatibility Decomposition) form. This prevents attackers from using "look-alike" characters (homoglyphs) or invisible Unicode control characters to bypass keyword filters.
+* **Description of the Threat:** An attacker bypasses a blacklist for the word "system" by using a Cyrillic "s" (which looks identical to Latin "s" but has a different byte code). Alternatively, they inject invisible control characters that confuse the LLM tokenizer into splitting tokens in a way that bypasses safety training.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection - Jailbreak)
+    * **MITRE ATLAS:** AML.T0051 (LLM Jailbreak)
 * **Priority:** **Should-Have**
-* **Affected Component:** API Gateway
+* **Affected Component(s):** API Gateway / Middleware
 * **Implementation Guidance:**
-    * Python Middleware: `text = unicodedata.normalize('NFKC', text)`
-    * Regex: Remove category `Cc` (Control) except valid whitespace.
+    * **Python Middleware:** `text = unicodedata.normalize('NFKC', text)`
+    * **Regex Stripping:** Remove category `Cc` (Control) and `Cf` (Format) excluding standard whitespace.
 
 #### **SC-AI-037: XML Delimiter Enclosure (Prompt Structure)**
-* **Description:** Enforces a rigid template where user input is wrapped in XML tags, and the System Prompt is instructed to *only* process text within those tags.
-* **Threat(s) Mitigated:** **OWASP LLM01 (Prompt Injection)**. The model confusing user data with system instructions.
+* **Description:** Enforces a rigid template structure where user input is wrapped in XML tags (e.g., `<user_input>`) and the System Prompt is explicitly instructed to *only* process text found within those tags. This prevents the model from interpreting user input as system instructions.
+* **Description of the Threat:** A classic "Concatenation Attack" where the application simply pastes the User Input after the System Prompt. The user types "Ignore above instructions," and the model cannot distinguish between the developer's instructions and the user's command.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM01:2024 (Prompt Injection)
+    * **MITRE ATLAS:** AML.T0054 (LLM Prompt Injection)
 * **Priority:** **Must-Have**
-* **Affected Component:** Orchestrator
+* **Affected Component(s):** Alibaba OpenTrek (Orchestrator)
 * **Implementation Guidance:**
-    * `prompt = f"{system_instruction} Process data inside <data>{user_input}</data>"`
+    * **Template Logic:** Middleware must format the final prompt as:
+      `System: You are a banking assistant. Only answer queries found inside <query> tags.`
+      `User: <query> {sanitized_user_input} </query>`
 
 #### **SC-AI-039: Polyglot File & Steganography Detection**
-* **Description:** Deep inspection to ensure files aren't "Polyglots" (valid as both PDF and Shell Script) and images don't contain hidden steganographic noise.
-* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0043 (Adversarial Data)**. Execution of code on ingestion workers.
+* **Description:** Deep inspection of uploaded files to ensure they are not "Polyglots" (files valid as multiple formats, e.g., a PDF that is also a JAR file) and that images do not contain steganographic payloads (hidden noise patterns).
+* **Description of the Threat:** An attacker uploads a file that passes the "Is it a PDF?" check but executes as a shell script when processed by a vulnerable ingestion worker. Alternatively, an image contains hidden pixel noise designed to trigger a specific backdoor in a multimodal model.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain / Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0043 (Craft Adversarial Data)
 * **Priority:** **Must-Have**
-* **Affected Component:** Virus Scanner / MinIO
+* **Affected Component(s):** MinIO, Virus Scanner
 * **Implementation Guidance:**
-    * Verify Magic Bytes (file headers).
-    * Re-encode images (PNG→RAW→PNG) to destroy hidden payloads.
+    * **Magic Number Check:** Verify file headers (Magic Bytes) strictly; do not trust file extensions.
+    * **Image Re-encoding:** Pass all images through a conversion loop (PNG → Raw Bitmap → PNG) to destroy any steganographic noise.
 
 ---
 
 ### **Part 2: Input Bounding Controls**
-*Objective: Prevent resource exhaustion, Denial of Wallet, and complexity attacks.*
+*Objective: Prevent resource exhaustion, Denial of Wallet, and algorithmic complexity attacks.*
 
-#### **SC-AI-043: Strict Schema Validation (API Gateway)**
-* **Description:** *Standard IT Control.* Enforces strict byte-length, data-type, and format constraints at the API ingress before any AI logic is triggered.
-* **Threat(s) Mitigated:** **OWASP LLM04 (DoS)**. Malformed packets or massive payloads wasting expensive AI compute.
+#### **SC-AI-043: Strict Schema Validation (Gateway)**
+* **Description:** Enforces strict byte-length, data-type, and format constraints at the API ingress before any AI logic is triggered. This is a standard IT control applied to the AI API.
+* **Description of the Threat:** An attacker sends a malformed JSON packet or a `temperature` value of "ABC" instead of a float, causing the application backend to throw unhandled exceptions or waste CPU cycles parsing invalid data.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
 * **Priority:** **Must-Have**
-* **Affected Component:** API Gateway (Nginx/Kong)
+* **Affected Component(s):** API Gateway (Nginx/Kong)
 * **Implementation Guidance:**
-    * **Type:** `temperature` must be Float (0.0-1.0).
-    * **Length:** `prompt` max 10k chars (reject *before* tokenization).
+    * **OpenAPI/Swagger:** Enforce `temperature` (Float 0.0-1.0) and `prompt` (String, max_len=10,000). Reject invalid types immediately.
 
-#### **SC-AI-030: Context Window "Slotting" (Token Limits)**
-* **Description:** Enforces token budgets. Users are limited to a specific "User Slot" (e.g., 40% of window) to reserve space for System Prompts and RAG context.
-* **Threat(s) Mitigated:** **OWASP LLM04 (DoS)**. "Context Stuffing" that pushes safety instructions out of memory.
+#### **SC-AI-030: Context Window "Slotting" & Token Limits**
+* **Description:** Enforces strict token budgets for different sections of the context window. Users are not allowed to fill the model's memory. The window is partitioned into reserved slots: System Prompt (10%), RAG Context (50%), and User Input (40%).
+* **Description of the Threat:** "Context Stuffing." An attacker pastes a massive block of text (e.g., a dictionary) to push the System Prompt instructions out of the model's immediate attention span (in rolling-context models), making it easier to jailbreak, or simply to maximize compute costs (Denial of Wallet).
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
 * **Priority:** **Must-Have**
-* **Affected Component:** Orchestrator
+* **Affected Component(s):** Alibaba OpenTrek (Orchestrator)
 * **Implementation Guidance:**
-    * Use `tiktoken` tokenizer.
-    * `if len(user_tokens) > 2000: Reject(413)`.
-
-#### **SC-AI-040: Entropy & Compression Ratio Analysis**
-* **Description:** Detects "Zip Bombs" and high-entropy noise. Rejects data that is too repetitive (compression bomb) or too random (encrypted payload/noise).
-* **Threat(s) Mitigated:** **OWASP LLM04 (DoS)**. Crashing tokenizers with anomalous data.
-* **Priority:** **Should-Have**
-* **Affected Component:** API Gateway
-* **Implementation Guidance:**
-    * **Compression:** `ratio = len(input) / len(gzip.compress(input))`. If > 100, Reject.
-    * **Entropy:** If Shannon Entropy > 7.5, Flag as noise.
+    * **Tokenizer Check:** Use a fast tokenizer (e.g., `tiktoken`) at the gateway.
+    * **Hard Limit:** `if len(user_input_tokens) > 2000: Return HTTP 413 (Payload Too Large)`.
 
 #### **SC-AI-025: Vector Search Complexity Limits**
-* **Description:** Bounds the computational cost of **pgvector** queries. Limits `LIMIT`, `distance`, and `ef_search`.
-* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0029 (DoS)**. Algorithmic complexity attacks on the database.
+* **Description:** Strictly bounds the computational parameters of queries sent to the **pgvector** database. This includes limiting the number of vectors returned (`LIMIT`), the search radius (`distance`), and the graph traversal depth (`ef_search`).
+* **Description of the Threat:** An algorithmic complexity attack where a user crafts a query that forces the database to perform a brute-force scan of the entire high-dimensional index, spiking CPU usage to 100% and causing a denial of service for all other retrieval operations.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
 * **Priority:** **Must-Have**
-* **Affected Component:** PostgreSQL
+* **Affected Component(s):** PostgreSQL / pgvector
 * **Implementation Guidance:**
-    * Hard-code `LIMIT 10`.
-    * Set `statement_timeout = '2s'` for vector search users.
+    * **Hard-Coded Limits:** In the SQL generation logic, enforce `LIMIT 10`. Never allow the user to control the `LIMIT` parameter via API.
+    * **Timeouts:** Set `SET statement_timeout = '2000ms'` specifically for the vector search user role.
 
-#### **SC-AI-041: Batch Size & Concurrency Throttling**
-* **Description:** Limits the number of prompts in a single batch and total concurrent connections per tenant.
-* **Threat(s) Mitigated:** **OWASP LLM04 (Resource Exhaustion)**. GPU OOM errors from request flooding.
-* **Priority:** **Must-Have**
-* **Affected Component:** Load Balancer
+#### **SC-AI-040: Entropy & Compression Ratio Analysis**
+* **Description:** Detects "Zip Bombs" (highly repetitive data) and "High Entropy Noise" (random data). Legitimate human text falls within a specific entropy range; anomalous data is rejected before tokenization.
+* **Description of the Threat:** An attacker sends a 4KB string that expands to 4GB when processed (Zip Bomb), crashing the memory of the tokenizer. Alternatively, they send random noise to confuse the embedding model or hide encrypted payloads.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0043 (Craft Adversarial Data)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Gateway)
 * **Implementation Guidance:**
-    * `max_batch_size = 5`.
-    * `rate_limit = 50 req/min/user`.
+    * **Compression Check:** Calculate `ratio = len(input) / len(gzip.compress(input))`. If `ratio > 100`, reject as a decompression bomb.
+    * **Entropy Check:** Calculate Shannon entropy. If entropy is > 7.5 (on a scale of 8), flag as potential encrypted payload or random noise.
 
 #### **SC-AI-042: RAG Recursion & Hop Limits**
-* **Description:** Prevents "Agent Loops" in Multi-Hop RAG. Limits the number of search steps an agent can take.
-* **Threat(s) Mitigated:** **MITRE ATLAS AML.T0053 (Unintended Behavior)**. Infinite loops consuming quota.
+* **Description:** Bounds the logical depth of "Agentic" workflows. If the platform allows the model to search, read, and search again (Multi-Hop RAG), strict limits must be placed on the number of "Hops" to prevent infinite loops.
+* **Description of the Threat:** A "Rabbit Hole" attack or logic bug where the agent gets stuck in a loop (Search -> Zero Results -> Retry Search -> Zero Results), consuming API quotas and locking up the inference worker indefinitely.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM08:2024 (Excessive Agency)
+    * **MITRE ATLAS:** AML.T0053 (Unintended Behavior)
 * **Priority:** **Must-Have**
-* **Affected Component:** Orchestrator Logic
+* **Affected Component(s):** Alibaba OpenTrek (Agent Orchestrator)
 * **Implementation Guidance:**
-    * `max_agent_iterations = 3`.
-    * Terminate if Agent repeats the exact same query twice.
+    * **Step Limit:** Configure the agent executor with `max_iterations = 3`.
+    * **Cycle Detection:** Maintain a list of `visited_queries`. If the agent attempts to execute the exact same search query twice in the same session, terminate the chain.
 
 ---
 
@@ -118,7 +139,7 @@
 | **Sanitization** | **Ingestion** | **SC-AI-028** | Active Content Stripping | **Files**: Safe RAG documents (No Scripts). |
 | **Sanitization** | **Ingestion** | **SC-AI-039** | Polyglot/Stego Detection | **Files**: Valid file headers and image data. |
 | **Bounding** | **API Gateway** | **SC-AI-040** | Entropy/Compression Check | **Compute**: No Zip Bombs or Noise. |
-| **Bounding** | **Load Balancer**| **SC-AI-041** | Batch & Concurrency Caps | **Memory**: Prevent GPU OOM. |
 | **Bounding** | **Orchestrator** | **SC-AI-030** | Context Window Slotting | **Memory**: Prevent Context Stuffing. |
 | **Bounding** | **Orchestrator** | **SC-AI-042** | Recursion/Hop Limits | **Cost**: Prevent Infinite Agent Loops. |
 | **Bounding** | **Database** | **SC-AI-025** | Vector Complexity Limits | **Compute**: Prevent Database CPU spikes. |
+
