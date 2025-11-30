@@ -1,0 +1,85 @@
+This section details the **Model Deployment & Release Management Architecture**.
+
+ the "Deployment" phase is the final control gate. It transforms a static artifact into a running process. Security controls here must ensure that **only** approved, signed, and tested models reach production, and that they do so in a way that allows for immediate containment if safety regressions (e.g., sudden toxicity) are detected.
+
+### **Prioritized Model Deployment Controls**
+
+#### **SC-AI-099: Binary Authorization (Cryptographic Admission Control)**
+
+  * **Description:** A Kubernetes Admission Controller (Gatekeeper/Kyverno) that enforces a strict "No Signature, No Run" policy. Before any Pod with a model loader starts, the controller verifies the cryptographic signature of the model artifact URL against the trusted public keys in the HSM. It also verifies that the model's metadata tags in the registry explicitly state `status: APPROVED_FOR_PROD`.
+  * **Description of the Threat:** **Unauthorized Deployment / Insider Threat.** A developer, under pressure to fix a bug, bypasses the rigorous testing pipeline and manually deploys an unvetted model version (`v1.2-beta`) to the production cluster. This version contains a critical safety regression.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+      * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Kubernetes Control Plane, Model Registry
+  * **Implementation Guidance:**
+      * **Policy:** "Reject Pod if image/model signature is missing or invalid."
+      * **Attestation:** Use **Kritis** or **Kyverno** to check for the **Cosign** attestation created in the CI/CD pipeline.
+
+#### **SC-AI-100: Shadow Deployment (Dark Launch) Requirement**
+
+  * **Description:** Mandate that all major model upgrades must first pass through a "Shadow Mode" (or "Dark Launch"). Traffic is mirrored to the new model, but its outputs are *not* returned to the user. Instead, the outputs are asynchronously scored for safety/quality and compared against the current live model. Promotion to "Live" occurs only if the Shadow model's safety scores are equal to or better than the baseline.
+  * **Description of the Threat:** **Safety Regression.** The new model has better financial reasoning but has lost its resistance to jailbreaks. If you switch traffic instantly (Blue/Green), users immediately exploit this vulnerability. Shadow mode detects the drop in resistance without exposing users.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM09:2024 (Overreliance - Quality Control)
+      * **MITRE ATLAS:** AML.T0000 (Model Reliability)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Alibaba OpenTrek (Traffic Mirroring)
+  * **Implementation Guidance:**
+      * **Traffic Mirroring:** Use **Istio** mirroring:
+        ```yaml
+        route:
+        - destination: host: model-v1
+          weight: 100
+        mirror:
+          host: model-v2
+        ```
+      * **Comparator:** A background worker compares `v1_response` vs `v2_response` on safety metrics.
+
+#### **SC-AI-101: Segregation of Duties (Pipeline-Only Deployments)**
+
+  * **Description:** Strictly enforce that human users (even Admins) generally have **Read-Only** access to the Production Kubernetes cluster. Deployments can *only* be triggered by the approved CI/CD Service Account (e.g., Jenkins/GitLab Runner), which authenticates via short-lived tokens. This eliminates "Configuration Drift" and ensures no one can "hot-patch" a running model container.
+  * **Description of the Threat:** **Manual Tampering.** A malicious administrator `kubectl exec`s into a running inference pod and modifies the Python inference script to log all user prompts to a hidden external server.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+      * **MITRE ATLAS:** AML.T0000 (Persistence)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Kubernetes RBAC, CI/CD Pipeline
+  * **Implementation Guidance:**
+      * **RBAC:** `RoleBinding: developers -> view`, `RoleBinding: pipeline-sa -> edit`.
+      * **Break-Glass:** "Emergency Admin" access is only available via a PAM (Privileged Access Management) system that logs every keystroke.
+
+#### **SC-AI-102: Immutable Versioning (Ban "Latest" Tags)**
+
+  * **Description:** Strictly prohibit the use of mutable tags like `:latest`, `:staging`, or `:prod` for model artifacts or container images in deployment manifests. All deployments must reference a specific, immutable SHA-256 digest or a semantic version number that is legally locked in the registry.
+  * **Description of the Threat:** **Supply Chain Drift.** The deployment config references `model:latest`. An attacker compromises the registry and pushes a malicious model tagged `latest`. The Kubernetes cluster, seeing the tag hasn't changed (conceptually) but the hash has, might pull the new malware automatically upon a restart.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+  * **Priority:** **Must-Have**
+  * **Affected Component(s):** Kubernetes Manifests, OPA Gatekeeper
+  * **Implementation Guidance:**
+      * **OPA Rule:** Deny deployment if image/model path does not contain a specific version digest (e.g., `@sha256:...` or `:v1.0.2`).
+
+#### **SC-AI-103: Automated Rollback on Safety Signals**
+
+  * **Description:** Integrate the deployment pipeline with the "Behavioral Monitoring" system (SC-AI-095). If the "Refusal Rate" or "Toxicity Score" spikes beyond a defined threshold (e.g., \>5% increase) within the first 15 minutes of a new deployment, the system must **automatically** trigger a rollback to the previous known-good version without human intervention.
+  * **Description of the Threat:** **Flash Crash / Mass Exploitation.** A new model version is deployed that has a trivial "Universal Jailbreak" vulnerability. Within minutes, attackers (or curious users) discover it. A manual rollback takes 30 minutes; an automated one takes 30 seconds.
+  * **Threat(s) Mitigated:**
+      * **OWASP:** General Incident Response
+      * **MITRE ATLAS:** AML.T0000 (Remediation)
+  * **Priority:** **Should-Have**
+  * **Affected Component(s):** CD Pipeline (ArgoCD/Flux), Monitoring (Prometheus)
+  * **Implementation Guidance:**
+      * **Progressive Delivery:** Use **Flagger** or **Argo Rollouts**.
+      * **Metric Analysis:** Define a Prometheus query for the rollback gate: `sum(rate(jailbreak_attempts[5m])) > threshold`.
+
+### **Summary of Deployment Strategy**
+
+| Control ID | Control Name | Mechanism | Primary Goal |
+| :--- | :--- | :--- | :--- |
+| **SC-AI-099** | **Binary Authorization** | **Admission Controller** | "No Signature, No Run." |
+| **SC-AI-100** | **Shadow Deployment** | **Traffic Mirroring** | Test safety without user exposure. |
+| **SC-AI-101** | **Segregation of Duties** | **RBAC / Pipeline-Only** | Prevent human tampering in Prod. |
+| **SC-AI-102** | **Immutable Versioning** | **Digest Locking** | Prevent tag hijacking/drift. |
+| **SC-AI-103** | **Auto-Rollback** | **Metric Triggers** | Instant remediation of bad models. |
