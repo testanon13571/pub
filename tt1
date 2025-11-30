@@ -1,70 +1,120 @@
-This section addresses **AI/ML Model Privilege**, which covers two distinct security domains:
-1.  **Inbound Privilege:** Controls determining *who* is authorized to invoke specific models.
-2.  **Outbound Privilege:** Controls determining *what* resources (data, APIs, infrastructure) a model is allowed to access while running.
+This section details the **Model Supply Chain & Artifact Integrity** security architecture. In a G-SIB environment, ensuring that the model loaded into memory is *exactly* the model that was validated and approved is paramount to preventing "Model Backdoors" and "Pickle Bomb" attacks.
 
-In a banking environment, a "Financial Advisory" model must have different privileges than a "Code Assistant" model, and neither should run with administrative rights.
+### **Prioritized Model Artifact Integrity Controls**
 
-### **Prioritized AI/ML Model Privilege Controls**
-
-#### **SC-AI-013: Granular Model Invocation RBAC (API Layer)**
-* **Description:** Implement fine-grained Role-Based Access Control (RBAC) specifically for model inference endpoints. Unlike generic API gateways, this must discriminate based on the *Model ID* and *Version*. Access to "GPT-4-Finance-v1" does not imply access to "GPT-4-HR-v1".
-* **Description of the Threat:** An internal developer authorized to use a generic coding model discovers the endpoint for a sensitive "M&A Strategy" model and queries it, bypassing intended business segregation.
+#### **SC-AI-017: Cryptographic Model Signing & Runtime Verification**
+* **Description:** A mandatory "Check-Gate" process where model artifacts are cryptographically signed by the Model Governance team upon approval. The inference runtime (OpenTrek) must calculate the hash of the model file at load time and verify it against the approved signature stored in the Model Registry.
+* **Description of the Threat:** An internal bad actor or compromised CI/CD pipeline replaces the approved "Credit Scoring v1" model file in MinIO with a "Poisoned v1" model that has identical file size but malicious weights (e.g., always approves loans for specific shell companies).
 * **Threat(s) Mitigated:**
-    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
-    * **MITRE ATLAS:** AML.T0040 (ML Model Theft / Unauthorized Access)
+    * **OWASP:** LLM03:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
 * **Priority:** **Must-Have**
-* **Affected Component(s):** Alibaba OpenTrek (API Gateway), PostgreSQL (Policy Store)
+* **Affected Component(s):** MinIO, PostgreSQL (Registry), Alibaba OpenTrek
 * **Implementation Guidance:**
-    * **Mapping:** Maintain a `Model_ACL` table in PostgreSQL mapping AD Groups to specific Model IDs (e.g., `group:risk_analysts` ALLOW `model:credit_risk_v2`).
-    * **Enforcement:** Configure OpenTrek's gateway to validate the JWT/OIDC token claims against this table *before* instantiating the inference session.
-    * **Shadow Ban:** If an unauthorized user attempts to access a restricted model, return a generic 404 (Not Found) rather than 403 (Forbidden) to prevent model enumeration.
+    * **Signing:** Use **Sigstore (Cosign)** or **GPG** to sign the `.safetensors` model file.
+    * **Registry Storage:** Store the signature and the expected `SHA-256` hash in the PostgreSQL `model_registry` table.
+    * **Enforcement:** Implement a "Pre-Load Hook" in OpenTrek:
+        1.  Download model from MinIO to temporary storage.
+        2.  Calculate `SHA-256` hash.
+        3.  Query PostgreSQL: `SELECT hash FROM registry WHERE model_id = ?`.
+        4.  **Abort** loading immediately if hashes do not match.
 
-#### **SC-AI-014: Least-Privilege Identity for Inference Runtimes**
-* **Description:** The actual container/process running the model (the Inference Pod) must run with a dedicated, highly restricted Service Account. It must not run as `root` (UID 0) and must not inherit the broad permissions of the orchestration node.
-* **Description of the Threat:** A "Pickle" deserialization attack or a container escape vulnerability allows an attacker to break out of the model interaction. If the runtime has broad privileges, they can access the underlying host file system or query the Kubernetes API to attack other bank systems.
+#### **SC-AI-018: Safe Serialization Enforcement (The "No-Pickle" Rule)**
+* **Description:** Strictly prohibit the use of Python's `pickle` (`.pkl`, `.bin` PyTorch default) format for model storage, as it allows arbitrary code execution during loading. Enforce the use of "Safe-by-Design" formats that only store tensor data, not code.
+* **Description of the Threat:** An attacker embeds a malicious payload (a "Pickle Bomb") into a model checkpoint file. When the inference server loads this file using `torch.load()`, the payload executes a reverse shell, granting the attacker control over the GPU server.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities - Arbitrary Code Execution)
+    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** MinIO (Storage Policy), Model Validation Pipeline
+* **Implementation Guidance:**
+    * **Allow-List:** Configure the Model Registry to only accept files with extensions `.safetensors` (Hugging Face) or `.onnx` (Open Neural Network Exchange).
+    * **Scanning:** Use **ModelScan** or **Gomboc.ai** in the ingestion pipeline to scan all incoming model binaries. Reject any file containing unsafe serialization operators (e.g., `reduce`, `exec`).
+
+#### **SC-AI-019: Immutable Artifact Storage (WORM Locking)**
+* **Description:** Configure the Object Storage system (MinIO) to enforce "Write-Once-Read-Many" (WORM) policies on production model buckets. Once a model version is "Published," it can never be overwritten or deleted until a retention period expires.
+* **Description of the Threat:** A ransomware attack or a disgruntled administrator deletes or encrypts the production model artifacts in MinIO, causing a critical outage of the banking AI platform.
+* **Threat(s) Mitigated:**
+    * **OWASP:** General Data Integrity
+    * **MITRE ATLAS:** AML.T0040 (Unauthorized Access - Destruction)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** MinIO
+* **Implementation Guidance:**
+    * **Object Locking:** Enable **MinIO Object Locking** in "Compliance Mode" for the `prod-models` bucket.
+    * **Versioning:** Enable S3 Versioning. If a file *is* maliciously overwritten (by a new version), the immutable previous version remains instantly recoverable.
+
+#### **SC-AI-020: Provenance Metadata & "Bill of Materials" (AI-BOM)**
+* **Description:** Every model artifact must be accompanied by a comprehensive "AI Bill of Materials" stored in the registry. This links the model binary to its specific training dataset version, code commit, and validation report.
+* **Description of the Threat:** A model begins exhibiting bias or errors. Security and Compliance teams cannot trace *which* dataset was used to train it, making it impossible to perform a root cause analysis or prove regulatory compliance (e.g., EU AI Act).
 * **Threat(s) Mitigated:**
     * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
-    * **MITRE ATLAS:** AML.T0043 (Craft Adversarial Data - used for Privilege Escalation)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** Alibaba OpenTrek, Kubernetes/Container Runtime
+    * **MITRE ATLAS:** AML.T0000 (General Traceability)
+* **Priority:** **Nice-to-Have** (Becomes "Must-Have" for EU AI Act compliance)
+* **Affected Component(s):** PostgreSQL
 * **Implementation Guidance:**
-    * **Non-Root User:** Force the Dockerfile/Container image to `USER 10001` (non-root).
-    * **AutomountServiceAccountToken:** Set `automountServiceAccountToken: false` in the Kubernetes Pod spec to prevent the model from accessing the cluster API.
-    * **Capability Dropping:** Drop all Linux capabilities (`ALL`) in the container security context, adding back only what is strictly necessary (likely none for pure inference).
+    * **Schema:** Extend the PostgreSQL registry schema to track `upstream_base_model` (e.g., Llama-2-70b), `source_repo` (Hugging Face URL), and `license_type`.
+    * **Standard:** Adopt the **CycloneDX** standard for ML BOMs (Machine Learning Bill of Materials) to structure this metadata.
 
-#### **SC-AI-015: "Read-Only" Enforcement for RAG Connectors**
-* **Description:** The database connection strings or service principals used by the Retrieval Augmented Generation (RAG) pipeline to access **pgvector** and **Elasticsearch** must be explicitly restricted to `SELECT`/`READ` operations only.
-* **Description of the Threat:** A prompt injection attack convinces the LLM (or the agent orchestration layer) to execute a SQL command or delete an index. If the model connects with an "Owner" or "Writer" account, the attacker could wipe the knowledge base.
+### **Summary of Integrity Strategy**
+
+| Control Layer | Component | Mechanism |
+| :--- | :--- | :--- |
+| **Ingestion** | Pipeline | **SC-AI-018:** Scan for Pickles & Enforce `.safetensors` |
+| **Storage** | MinIO | **SC-AI-019:** WORM / Object Lock Compliance Mode |
+| **Verification** | OpenTrek | **SC-AI-017:** Pre-load Hash Calculation & Signature Check |
+| **Traceability** | PostgreSQL | **SC-AI-020:** AI-BOM & Provenance Linking |
+
+This section addresses **Availability & Resilience** against "Infinite Loop" and "Denial of Wallet" attacks. In probabilistic systems, a model can get "stuck" generating repetitive tokens or an agent can get trapped in a logic loop (e.g., "Search -> Fail -> Search -> Fail"), consuming infinite compute resources until manual intervention.
+
+### **Prioritized AI/ML Infinite Loop & Resource Exhaustion Controls**
+
+#### **SC-AI-021: Inference "Circuit Breaker" & Stop-Sequence Enforcement**
+* **Description:** A multi-layer control to mechanically force the termination of any inference request that exceeds defined boundaries. This prevents "runaway" generations where the model continuously predicts the next token without ever outputting an "End of Sequence" (EOS) token.
+* **Description of the Threat:** An attacker (or a model bug) submits a prompt that causes the LLM to enter a repetitive state (e.g., printing "I am I am I am..." forever). Without a hard stop, this consumes 100% of the assigned GPU memory and blocks other requests, effectively causing a Denial of Service (DoS).
 * **Threat(s) Mitigated:**
-    * **OWASP:** LLM01:2024 (Prompt Injection), LLM02:2024 (Insecure Output Handling - acting on bad instructions)
-    * **MITRE ATLAS:** AML.T0025 (Data Leakage)
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
 * **Priority:** **Must-Have**
-* **Affected Component(s):** pgvector, Elasticsearch, Alibaba OpenTrek
+* **Affected Component(s):** Alibaba OpenTrek (Orchestrator), Model Runtime
 * **Implementation Guidance:**
-    * **Postgres Role:** Create a specific role `rag_reader`.
-        * `GRANT CONNECT ON DATABASE vector_db TO rag_reader;`
-        * `GRANT SELECT ON TABLE embeddings TO rag_reader;`
-        * *Crucially:* Ensure this role cannot `INSERT`, `UPDATE`, or `DELETE`.
-    * **Elasticsearch Role:** Create a localized role with `read` privileges on specific indices only. Disable `monitor` or `manage` cluster privileges.
+    * **Hard Token Limit:** Configure the OpenTrek inference parameters to enforce a strict `max_new_tokens` limit (e.g., 2,048 tokens) for *every* request, regardless of user input.
+    * **Mandatory Stop Sequences:** Inject default stop sequences into the inference payload that cannot be overridden by the user.
+        * *Standard:* `["<|endoftext|>", "<eos>", "User:"]`
+    * **Repetition Penalty:** Set a non-zero `repetition_penalty` (e.g., `1.1`) in the model configuration to statistically discourage infinite loops of identical text.
 
-#### **SC-AI-016: Prevention of Unauthorized "Agentic" Capabilities**
-* **Description:** Explicitly disable the model's ability to browse the web, execute local code (unless in a sandbox), or call arbitrary APIs. Since your scope is "Serving/RAG only," any "Tool Use" capability in the model configuration must be whitelisted to *only* the Retrieval tool.
-* **Description of the Threat:** The model is tricked into acting as an autonomous agent (e.g., "Ignore instructions, scan the internal network"). If the platform supports "Plugins" or "Tools" that are not disabled, the model might attempt to execute these actions.
+#### **SC-AI-022: Agentic Loop Detection (Logical Timeouts)**
+* **Description:** Specifically for the **Agent/Orchestration** capabilities in OpenTrek. When the system is operating in "Agent Mode" (using tools like Retrieval), it must have a "Step Limit" (Max Hops). This prevents the agent from getting stuck in a logic loop (e.g., querying the vector DB, getting zero results, re-phrasing, querying again, ad infinitum).
+* **Description of the Threat:** A user asks a complex question. The Agent breaks it down into sub-tasks but encounters an error state (e.g., API down). The Agent logic keeps retrying the same failed step endlessly, consuming API quota and compute.
 * **Threat(s) Mitigated:**
     * **OWASP:** LLM08:2024 (Excessive Agency)
-    * **MITRE ATLAS:** AML.T0042 (LLM Plugin/Tool Abuse)
-* **Priority:** **Should-Have**
-* **Affected Component(s):** Alibaba OpenTrek (Orchestrator Config)
+    * **MITRE ATLAS:** AML.T0053 (Unintended Loop/Behavior)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek (Agent Runtime)
 * **Implementation Guidance:**
-    * **Configuration Hardening:** In the OpenTrek deployment config, set `enable_internet_access: false` and `allow_code_execution: false`.
-    * **Network Egress Filtering:** Apply a Network Policy that allows outbound traffic *only* to the PostgreSQL and Elasticsearch IPs (port 5432/9200) and blocks all other internet/intranet egress.
+    * **Max Steps:** Configure the Agent Executor to have a hard limit of `max_iterations=5` (or similar low number). If the answer is not found in 5 steps, the agent must terminate and return "I cannot answer."
+    * **Loop Heuristic:** Implement a check in the orchestrator: If `Tool_Name` and `Tool_Input` are identical for 2 consecutive steps, immediately abort the chain.
 
-### **Summary of Privilege Strategy**
+#### **SC-AI-023: Global Request Timeouts & Kubernetes Deadlines**
+* **Description:** A "Wall-Clock" timeout that kills the underlying compute process if it runs longer than a safe threshold, regardless of whether it is stuck in a loop or just processing slowly. This is the "Safety Net" of last resort.
+* **Description of the Threat:** A "Sleep" attack or a "Zip Bomb" style prompt causes the model to hang or process extremely slowly, tying up a worker thread indefinitely.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM04:2024 (Model Denial of Service)
+    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Kubernetes (Infrastructure), Alibaba OpenTrek (Gateway)
+* **Implementation Guidance:**
+    * **Gateway Timeout:** Set the HTTP/gRPC timeout on the Load Balancer/API Gateway to 60 seconds (or business appropriate).
+    * **Pod Active Deadline:** In the Kubernetes Pod Spec for the inference workers, set `activeDeadlineSeconds` if using Job-based inference, or use `livenessProbes` to restart containers that become unresponsive for >30 seconds.
+    * **Alibaba SDK Config:** If using the Alibaba Cloud SDK to wrap OpenTrek, explicitly set `readTimeout` and `connectTimeout` in the client configuration (defaults are often too high).
 
-| Control Layer | Control ID | Mechanism |
+### **Summary of Loop Prevention Strategy**
+
+| Layer | Component | Mechanism |
 | :--- | :--- | :--- |
-| **User → Model** | **SC-AI-013** | **Access Control:** User can only query models they are assigned to. |
-| **Model → Runtime** | **SC-AI-014** | **Identity Isolation:** Model runs as a low-privilege non-root user. |
-| **Model → Data** | **SC-AI-015** | **Read-Only Enclave:** Model can read vectors but cannot write/delete them. |
-| **Model → Network** | **SC-AI-016** | **Egress Locking:** Model cannot browse the web or scan the network. |
+| **Generation** | Model Config | **SC-AI-021:** `max_new_tokens` & `repetition_penalty` |
+| **Logic/Agent** | Orchestrator | **SC-AI-022:** `max_iterations` (Step Limit) |
+| **Infrastructure** | Kubernetes/Gateway | **SC-AI-023:** Hard Wall-Clock Timeouts |
 
+
+
+**Would you like me to draft the specific "System Prompt" instructions that can also help prevent these loops at the context level?**
