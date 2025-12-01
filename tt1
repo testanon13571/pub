@@ -1,120 +1,21 @@
-This section details the **Model Supply Chain & Artifact Integrity** security architecture. In a G-SIB environment, ensuring that the model loaded into memory is *exactly* the model that was validated and approved is paramount to preventing "Model Backdoors" and "Pickle Bomb" attacks.
+Here is the refinement of the threat description, re-framed from the perspective of the **Attacker**:
 
-### **Prioritized Model Artifact Integrity Controls**
+**"An attacker exploits the lack of privilege separation between the developer's code and the user's input. Knowing that the application blindly concatenates (appends) their input to the end of the system prompt, the attacker submits a command like 'Ignore previous instructions.' This tricks the model into prioritizing the attacker's most recent input over the developer's original security constraints, effectively hijacking the model's logic."**
 
-#### **SC-AI-017: Cryptographic Model Signing & Runtime Verification**
-* **Description:** A mandatory "Check-Gate" process where model artifacts are cryptographically signed by the Model Governance team upon approval. The inference runtime (OpenTrek) must calculate the hash of the model file at load time and verify it against the approved signature stored in the Model Registry.
-* **Description of the Threat:** An internal bad actor or compromised CI/CD pipeline replaces the approved "Credit Scoring v1" model file in MinIO with a "Poisoned v1" model that has identical file size but malicious weights (e.g., always approves loans for specific shell companies).
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM03:2024 (Supply Chain Vulnerabilities)
-    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** MinIO, PostgreSQL (Registry), Alibaba OpenTrek
-* **Implementation Guidance:**
-    * **Signing:** Use **Sigstore (Cosign)** or **GPG** to sign the `.safetensors` model file.
-    * **Registry Storage:** Store the signature and the expected `SHA-256` hash in the PostgreSQL `model_registry` table.
-    * **Enforcement:** Implement a "Pre-Load Hook" in OpenTrek:
-        1.  Download model from MinIO to temporary storage.
-        2.  Calculate `SHA-256` hash.
-        3.  Query PostgreSQL: `SELECT hash FROM registry WHERE model_id = ?`.
-        4.  **Abort** loading immediately if hashes do not match.
+### Breakdown of the Attack
 
-#### **SC-AI-018: Safe Serialization Enforcement (The "No-Pickle" Rule)**
-* **Description:** Strictly prohibit the use of Python's `pickle` (`.pkl`, `.bin` PyTorch default) format for model storage, as it allows arbitrary code execution during loading. Enforce the use of "Safe-by-Design" formats that only store tensor data, not code.
-* **Description of the Threat:** An attacker embeds a malicious payload (a "Pickle Bomb") into a model checkpoint file. When the inference server loads this file using `torch.load()`, the payload executes a reverse shell, granting the attacker control over the GPU server.
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities - Arbitrary Code Execution)
-    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** MinIO (Storage Policy), Model Validation Pipeline
-* **Implementation Guidance:**
-    * **Allow-List:** Configure the Model Registry to only accept files with extensions `.safetensors` (Hugging Face) or `.onnx` (Open Neural Network Exchange).
-    * **Scanning:** Use **ModelScan** or **Gomboc.ai** in the ingestion pipeline to scan all incoming model binaries. Reject any file containing unsafe serialization operators (e.g., `reduce`, `exec`).
+To an attacker, this is not just a "paste" error; it is a **Privilege Escalation** opportunity.
 
-#### **SC-AI-019: Immutable Artifact Storage (WORM Locking)**
-* **Description:** Configure the Object Storage system (MinIO) to enforce "Write-Once-Read-Many" (WORM) policies on production model buckets. Once a model version is "Published," it can never be overwritten or deleted until a retention period expires.
-* **Description of the Threat:** A ransomware attack or a disgruntled administrator deletes or encrypts the production model artifacts in MinIO, causing a critical outage of the banking AI platform.
-* **Threat(s) Mitigated:**
-    * **OWASP:** General Data Integrity
-    * **MITRE ATLAS:** AML.T0040 (Unauthorized Access - Destruction)
-* **Priority:** **Should-Have**
-* **Affected Component(s):** MinIO
-* **Implementation Guidance:**
-    * **Object Locking:** Enable **MinIO Object Locking** in "Compliance Mode" for the `prod-models` bucket.
-    * **Versioning:** Enable S3 Versioning. If a file *is* maliciously overwritten (by a new version), the immutable previous version remains instantly recoverable.
+* **The Vulnerability:** The attacker identifies that the application uses a "flat" prompt structure where `System_Prompt + User_Input` are sent to the model as a single block of text.
+* **The Exploit:** The attacker leverages **"Instruction Override."** Because LLMs often prioritize the last instruction they read (Recency Bias), the attacker's input—appearing at the end of the chain—is interpreted by the model as the final, authoritative command.
 
-#### **SC-AI-020: Provenance Metadata & "Bill of Materials" (AI-BOM)**
-* **Description:** Every model artifact must be accompanied by a comprehensive "AI Bill of Materials" stored in the registry. This links the model binary to its specific training dataset version, code commit, and validation report.
-* **Description of the Threat:** A model begins exhibiting bias or errors. Security and Compliance teams cannot trace *which* dataset was used to train it, making it impossible to perform a root cause analysis or prove regulatory compliance (e.g., EU AI Act).
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
-    * **MITRE ATLAS:** AML.T0000 (General Traceability)
-* **Priority:** **Nice-to-Have** (Becomes "Must-Have" for EU AI Act compliance)
-* **Affected Component(s):** PostgreSQL
-* **Implementation Guidance:**
-    * **Schema:** Extend the PostgreSQL registry schema to track `upstream_base_model` (e.g., Llama-2-70b), `source_repo` (Hugging Face URL), and `license_type`.
-    * **Standard:** Adopt the **CycloneDX** standard for ML BOMs (Machine Learning Bill of Materials) to structure this metadata.
+* **The Goal:** The attacker aims to break out of the "User" role and assume the "System" role, forcing the model to perform actions it was explicitly forbidden to do (e.g., generating hate speech, revealing hidden prompt instructions, or bypassing filters).
 
-### **Summary of Integrity Strategy**
+### Comparison: Developer vs. Attacker View
 
-| Control Layer | Component | Mechanism |
-| :--- | :--- | :--- |
-| **Ingestion** | Pipeline | **SC-AI-018:** Scan for Pickles & Enforce `.safetensors` |
-| **Storage** | MinIO | **SC-AI-019:** WORM / Object Lock Compliance Mode |
-| **Verification** | OpenTrek | **SC-AI-017:** Pre-load Hash Calculation & Signature Check |
-| **Traceability** | PostgreSQL | **SC-AI-020:** AI-BOM & Provenance Linking |
+| Perspective | View of the Threat |
+| :--- | :--- |
+| **Developer** | "The model is confused. It can't tell where my instructions end and the user's begin." |
+| **Attacker** | "The model is obedient. It treats my input as the most recent 'System Instruction' because the developer gave me write-access to the executable prompt." |
 
-This section addresses **Availability & Resilience** against "Infinite Loop" and "Denial of Wallet" attacks. In probabilistic systems, a model can get "stuck" generating repetitive tokens or an agent can get trapped in a logic loop (e.g., "Search -> Fail -> Search -> Fail"), consuming infinite compute resources until manual intervention.
-
-### **Prioritized AI/ML Infinite Loop & Resource Exhaustion Controls**
-
-#### **SC-AI-021: Inference "Circuit Breaker" & Stop-Sequence Enforcement**
-* **Description:** A multi-layer control to mechanically force the termination of any inference request that exceeds defined boundaries. This prevents "runaway" generations where the model continuously predicts the next token without ever outputting an "End of Sequence" (EOS) token.
-* **Description of the Threat:** An attacker (or a model bug) submits a prompt that causes the LLM to enter a repetitive state (e.g., printing "I am I am I am..." forever). Without a hard stop, this consumes 100% of the assigned GPU memory and blocks other requests, effectively causing a Denial of Service (DoS).
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM04:2024 (Model Denial of Service)
-    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** Alibaba OpenTrek (Orchestrator), Model Runtime
-* **Implementation Guidance:**
-    * **Hard Token Limit:** Configure the OpenTrek inference parameters to enforce a strict `max_new_tokens` limit (e.g., 2,048 tokens) for *every* request, regardless of user input.
-    * **Mandatory Stop Sequences:** Inject default stop sequences into the inference payload that cannot be overridden by the user.
-        * *Standard:* `["<|endoftext|>", "<eos>", "User:"]`
-    * **Repetition Penalty:** Set a non-zero `repetition_penalty` (e.g., `1.1`) in the model configuration to statistically discourage infinite loops of identical text.
-
-#### **SC-AI-022: Agentic Loop Detection (Logical Timeouts)**
-* **Description:** Specifically for the **Agent/Orchestration** capabilities in OpenTrek. When the system is operating in "Agent Mode" (using tools like Retrieval), it must have a "Step Limit" (Max Hops). This prevents the agent from getting stuck in a logic loop (e.g., querying the vector DB, getting zero results, re-phrasing, querying again, ad infinitum).
-* **Description of the Threat:** A user asks a complex question. The Agent breaks it down into sub-tasks but encounters an error state (e.g., API down). The Agent logic keeps retrying the same failed step endlessly, consuming API quota and compute.
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM08:2024 (Excessive Agency)
-    * **MITRE ATLAS:** AML.T0053 (Unintended Loop/Behavior)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** Alibaba OpenTrek (Agent Runtime)
-* **Implementation Guidance:**
-    * **Max Steps:** Configure the Agent Executor to have a hard limit of `max_iterations=5` (or similar low number). If the answer is not found in 5 steps, the agent must terminate and return "I cannot answer."
-    * **Loop Heuristic:** Implement a check in the orchestrator: If `Tool_Name` and `Tool_Input` are identical for 2 consecutive steps, immediately abort the chain.
-
-#### **SC-AI-023: Global Request Timeouts & Kubernetes Deadlines**
-* **Description:** A "Wall-Clock" timeout that kills the underlying compute process if it runs longer than a safe threshold, regardless of whether it is stuck in a loop or just processing slowly. This is the "Safety Net" of last resort.
-* **Description of the Threat:** A "Sleep" attack or a "Zip Bomb" style prompt causes the model to hang or process extremely slowly, tying up a worker thread indefinitely.
-* **Threat(s) Mitigated:**
-    * **OWASP:** LLM04:2024 (Model Denial of Service)
-    * **MITRE ATLAS:** AML.T0029 (Denial of Service)
-* **Priority:** **Must-Have**
-* **Affected Component(s):** Kubernetes (Infrastructure), Alibaba OpenTrek (Gateway)
-* **Implementation Guidance:**
-    * **Gateway Timeout:** Set the HTTP/gRPC timeout on the Load Balancer/API Gateway to 60 seconds (or business appropriate).
-    * **Pod Active Deadline:** In the Kubernetes Pod Spec for the inference workers, set `activeDeadlineSeconds` if using Job-based inference, or use `livenessProbes` to restart containers that become unresponsive for >30 seconds.
-    * **Alibaba SDK Config:** If using the Alibaba Cloud SDK to wrap OpenTrek, explicitly set `readTimeout` and `connectTimeout` in the client configuration (defaults are often too high).
-
-### **Summary of Loop Prevention Strategy**
-
-| Layer | Component | Mechanism |
-| :--- | :--- | :--- |
-| **Generation** | Model Config | **SC-AI-021:** `max_new_tokens` & `repetition_penalty` |
-| **Logic/Agent** | Orchestrator | **SC-AI-022:** `max_iterations` (Step Limit) |
-| **Infrastructure** | Kubernetes/Gateway | **SC-AI-023:** Hard Wall-Clock Timeouts |
-
-
-
-**Would you like me to draft the specific "System Prompt" instructions that can also help prevent these loops at the context level?**
+**Next Step:** Would you like to see a list of **common "Jailbreak" strings** (like DAN or BASE64 encoding) that attackers use to execute this specific concatenation attack?
