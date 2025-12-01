@@ -1,0 +1,145 @@
+This section details the **Version Control & Repository Security Architecture**.
+
+This catalog covers the entire stack: **Code** (Git), **Artifacts** (MinIO), **Knowledge** (pgvector/Elasticsearch), and **Configuration** (OpenTrek). It ensures that every component of your AI system is traceable, immutable, and recoverable.
+
+### **Category 1: Code & Logic Versioning (Git)**
+*Securing the "Recipe"*
+
+#### **SC-AI-109: Branch Protection & "Four-Eyes" Principle**
+* **Description:** Enforce strict branch protection rules on the `main` and `production` branches. Direct commits and "Force Pushes" are cryptographically blocked. All changes must occur via Pull Request (PR) requiring approval from at least two authorized reviewers (Segregation of Duties).
+* **Description of the Threat:** **Insider Threat / Malicious Code Injection.** A compromised developer account or a rogue employee directly pushes a "backdoor" into the inference logic on the `main` branch (e.g., "if user is me, allow access"). Without protection, this bypasses the testing pipeline.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain Vulnerabilities)
+    * **MITRE ATLAS:** AML.T0010 (ML Supply Chain Compromise)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Git Server (GitLab/GitHub Enterprise)
+* **Implementation Guidance:**
+    * **Git Config:** Enable `Require pull request reviews before merging` (Min reviewers: 2).
+    * **Code Owners:** Use `CODEOWNERS` files to require specific Security Team approval for changes to sensitive paths (e.g., `auth/`).
+    * **Block:** Check "Allow force pushes" -> **False**.
+
+#### **SC-AI-110: Verified Commit Signing (GPG/SSH)**
+* **Description:** Every commit to the repository must be cryptographically signed using a developer's private GPG or SSH key. The Version Control System (VCS) must be configured to reject any unsigned commits. This provides non-repudiation: proof of exactly *who* wrote the code.
+* **Description of the Threat:** **Identity Spoofing.** An attacker injects malicious code into the repo but configures the Git metadata (`user.email`) to look like it came from the Lead Architect. Without signatures, the audit trail is worthless.
+* **Threat(s) Mitigated:**
+    * **OWASP:** Supply Chain Integrity
+    * **MITRE ATLAS:** AML.T0000 (Impersonation)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Developer Workstations, Git Server
+* **Implementation Guidance:**
+    * **Workstations:** Provision YubiKeys holding the GPG private keys so keys cannot be stolen from disk.
+    * **Server:** Enable "Vigilant Mode" (GitHub) or "Reject Unsigned Commits" (GitLab).
+
+#### **SC-AI-111: Pre-Commit Secret Scanning (The "Talisman")**
+* **Description:** A mandatory hook that runs locally on the developer's machine (and again on the server) to scan all staged files for high-entropy strings, API keys, AWS tokens, or private certificates *before* the commit is allowed.
+* **Description of the Threat:** **Credential Leakage.** A data scientist accidentally commits their hardcoded `MINIO_ACCESS_KEY` or `PG_PASSWORD` into a Jupyter Notebook. Once committed, the secret is in the history forever, accessible to anyone with read access.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM06:2024 (Sensitive Information Disclosure)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Developer Workstations (Git Hooks)
+* **Implementation Guidance:**
+    * **Tooling:** Use **Talisman**, **TruffleHog**, or **Gitleaks**.
+    * **Configuration:** Configure as a `pre-commit` hook. If a secret is found, the `git commit` command fails with a blocking error.
+
+#### **SC-AI-113: Immutable Tagging Policy**
+* **Description:** Prevent the mutation, movement, or deletion of tags in the Git Repo. Once a release tag (e.g., `release-v1.0`) is created, it is frozen forever.
+* **Description of the Threat:** **Tag Hijacking.** A deployment script pulls `model:v1.0`. An attacker pushes a malicious model and "moves" the `v1.0` tag to point to the malware. The system pulls the malware thinking it is the safe version.
+* **Threat(s) Mitigated:**
+    * **OWASP:** Supply Chain Integrity
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Git Server
+* **Implementation Guidance:**
+    * **Git:** Enable "Protected Tags" for patterns like `v*` and `release-*`.
+
+---
+
+### **Category 2: Artifact Versioning (MinIO/S3)**
+*Securing the "Raw Ingredients"*
+
+#### **SC-AI-114: Bucket Versioning & MFA Delete**
+* **Description:** Explicitly enable S3 Versioning on all Model and RAG buckets. Enforce a policy that requires Multi-Factor Authentication (MFA) to permanently delete any object version, ensuring that "overwritten" files are always recoverable.
+* **Description of the Threat:** **Ransomware / Accidental Destruction.** A script error or a disgruntled engineer runs `rm -rf s3://prod-models/`. Without versioning, the bank's AI capability is destroyed instantly. With versioning, you simply undelete the latest markers.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain - Availability)
+    * **MITRE ATLAS:** AML.T0040 (Destruction of Data/Model)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** MinIO
+* **Implementation Guidance:**
+    * `mc version enable my-minio/prod-models`
+    * **IAM Policy:** Deny `s3:DeleteObjectVersion` to everyone except the "Break-Glass Admin" role.
+
+#### **SC-AI-115: Object Locking (Compliance Mode WORM)**
+* **Description:** Apply **S3 Object Locking** in `COMPLIANCE` mode to approved model artifacts. This mathematically prevents the file from being deleted or modified by *anyone* (including the root admin) until the retention period expires.
+* **Description of the Threat:** **Insider Threat (Root Admin).** A compromised Admin account tries to wipe the logs or the model history to cover their tracks. Compliance Mode prevents even the Admin from deleting the evidence/artifact.
+* **Threat(s) Mitigated:**
+    * **OWASP:** Data Integrity
+    * **Regulatory:** SEC 17a-4 (Immutable Records)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** MinIO
+* **Implementation Guidance:**
+    * **Retention:** `mc retention set --mode COMPLIANCE --validity 365d my-minio/prod-models/v1.0.0.safetensors`
+
+#### **SC-AI-116: Artifact-to-Git Cross-Linking (DVC Pattern)**
+* **Description:** Enforce a strict link between MinIO and Git. Every binary in MinIO must have a corresponding metadata file (e.g., `.dvc` or `model.json`) committed in Git that contains the **SHA-256 hash** of the MinIO object.
+* **Description of the Threat:** **Orphaned/Ghost Models.** You have a file `credit-model-vfinal.bin` in MinIO. No one knows which Git commit produced it. It becomes a "Black Box" that cannot be audited or reproduced.
+* **Threat(s) Mitigated:**
+    * **OWASP:** Supply Chain (Traceability)
+    * **Regulatory:** SR 11-7 (Reproducibility)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** MinIO, Git, CI/CD
+* **Implementation Guidance:**
+    * Use **DVC (Data Version Control)** or **MLflow**.
+    * **Rule:** The CI pipeline creates a `model.json` in Git containing: `{"artifact_url": "s3://...", "sha256": "..."}`.
+
+---
+
+### **Category 3: Derived Data & Configuration Versioning**
+*Securing the "Cooked Meal"*
+
+#### **SC-AI-117: Vector Database Point-in-Time Recovery (PITR)**
+* **Description:** Configure **PostgreSQL/pgvector** for Continuous Archiving and Point-in-Time Recovery (PITR). This allows you to "Rewind" the database to the exact microsecond before a corruption event occurred.
+* **Description of the Threat:** **RAG Poisoning / Schema Corruption.** A bad ingestion job corrupts 50% of your vector embeddings, or an attacker injects false documents. Standard nightly backups are insufficient (you lose 23 hours of data). PITR allows instant surgical recovery.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM03:2024 (Training Data Poisoning - RAG)
+    * **Availability:** Resilience against corruption.
+* **Priority:** **Must-Have**
+* **Affected Component(s):** PostgreSQL / pgvector
+* **Implementation Guidance:**
+    * **WAL Archiving:** Enable Write-Ahead Logging (WAL) archiving to MinIO.
+    * **Tooling:** Use **pgBackRest** or **Wal-G**.
+    * **Recovery Target:** `restore_command = '... --target-time="2024-01-01 14:00:00" ...'`
+
+#### **SC-AI-118: Elasticsearch Snapshot Lifecycle Management (SLM)**
+* **Description:** Automate the snapshotting of **Elasticsearch** indices to the MinIO "Backup" bucket. These snapshots must be synchronized with the Vector DB snapshots to ensure the "Lexical Search" and "Semantic Search" remain consistent.
+* **Description of the Threat:** **Index Drift / Desynchronization.** You restore the Vector DB to fix a corruption, but forget the Elasticsearch index. The RAG system now returns vectors for Document A but metadata for Document B, causing severe hallucinations.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM09:2024 (Overreliance - Data Quality)
+* **Priority:** **Should-Have**
+* **Affected Component(s):** Elasticsearch
+* **Implementation Guidance:**
+    * **SLM Policy:** Configure an SLM policy in Elasticsearch to snapshot indices every 6 hours.
+    * **Sync:** Schedule this to run immediately after the Postgres backup window.
+
+#### **SC-AI-119: Configuration-as-Code (CaC) for OpenTrek**
+* **Description:** The runtime configuration of **Alibaba OpenTrek** (e.g., routing rules, model variant weights, resource limits) must *not* be edited via the GUI/Console. It must be defined in **YAML/JSON files** stored in Git and applied via the CD pipeline.
+* **Description of the Threat:** **Configuration Drift.** An operator manually changes a timeout setting in the OpenTrek Console to fix an incident but forgets to document it. The next deployment overwrites this fix, causing a recurrence of the outage.
+* **Threat(s) Mitigated:**
+    * **Operational Stability:** Prevention of human error.
+* **Priority:** **Must-Have**
+* **Affected Component(s):** Alibaba OpenTrek
+* **Implementation Guidance:**
+    * **Repo:** Create a `serving-config` Git repo.
+    * **Pipeline:** `git push` -> CI Validation (Schema Check) -> `opentrek-cli apply -f config.yaml`.
+    * **Read-Only Console:** Remove "Write" permissions to the OpenTrek UI for human users.
+
+#### **SC-AI-112: Model-Code Lineage Binding ("The Golden Thread")**
+* **Description:** Enforce a strict link between the Model Registry and the Code Repository. Every Model Version registered in PostgreSQL must include the specific **Git Commit Hash** of the code used to validate/import it.
+* **Description of the Threat:** **Loss of Provenance.** An auditor asks, "This model failed. Show me the validation code that approved it." You have the model, but you don't know which version of the validation script was run, making root cause analysis impossible.
+* **Threat(s) Mitigated:**
+    * **OWASP:** LLM05:2024 (Supply Chain)
+    * **Regulatory:** SR 11-7 (Model Governance)
+* **Priority:** **Must-Have**
+* **Affected Component(s):** CI/CD Pipeline, Model Registry
+* **Implementation Guidance:**
+    * **Metadata:** In the Registry Schema, make `source_code_commit_sha` a non-nullable column.
+    * **Automation:** The CI pipeline extracts `git rev-parse HEAD` and injects it into the `register_model` API call.
