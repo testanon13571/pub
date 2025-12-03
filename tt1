@@ -1,90 +1,54 @@
-### **Control Name:** Model Resource Consumption & Traffic Throttling (Rate Limiting)
+To properly justify the "Dual-Layer Throttling" control in a Risk Register or Threat Model, you need to articulate the specific adverse events that occur if the control is absent.
 
-In the world of AI, Rate Limiting is not just about preventing DoS attacks (Availability); it is a critical **Financial Control** (Cost Management) and a **Security Control** (Anti-Brute Force).
+Here is the formulated threat description, categorized by **Availability**, **Financial**, and **Security** impacts.
 
-Because LLM inference is computationally expensive and billed by the "token," standard HTTP rate limiting (requests per second) is often insufficient. You must implement strategies that account for the **complexity** of the request, not just the count.
+### **Primary Threat: Model Denial of Service (DoS) & Resource Exhaustion**
+*(Mapping: OWASP LLM04)*
 
-[Image of API Gateway rate limiting architecture diagram]
+**Threat Description:**
+> "Without granular throttling and volume limits, an attacker—or a misconfigured internal script—can overwhelm the Limited Inference Capacity of the LLM infrastructure. Unlike standard web servers, LLM inference is computationally heavy (GPU-bound). A relatively low number of high-volume requests (e.g., massive context inputs or maximum token generation requests) can occupy all available GPU slots."
 
------
+**The Attack Vectors:**
+1.  **The "Context Expansion" Attack (Volume):** An attacker sends requests containing maximum-length nonsense text (e.g., repeating a word 10,000 times) to force the model to process the full context window, causing extreme latency spikes for all other users.
+2.  **The "Generation Loop" Attack (Compute):** An attacker prompts the model to 'count to infinity' or generate infinite code loops, forcing the GPU to work until it hits a hard timeout.
+3.  **The "Retry Storm" (Frequency):** A legitimate internal application fails and enters a rapid retry loop, accidentally flooding the model API.
 
-### **1. The Core Differentiator: Human vs. Machine**
+**Impact:** System outage, extreme latency (seconds becomes minutes), and blocking of legitimate business traffic.
 
-The control must apply different logic depending on the actor.
+---
 
-| Feature | **Human-to-Machine (H2M)** | **Machine-to-Machine (M2M)** |
+### **Secondary Threat: Economic / Wallet Denial of Service (EDoS)**
+*(Mapping: Financial Risk)*
+
+**Threat Description:**
+> "LLM providers (OpenAI, Anthropic, Vertex AI) and internal GPU clusters bill based on **token consumption**, not just request count. A malicious actor or a negligent user can engage in 'Resource Burning' by repeatedly triggering high-cost tasks (e.g., analyzing 100-page PDFs) without exceeding standard request-based rate limits."
+
+**The Scenario:**
+> A user connects a script to the chatbot API that re-sends the entire conversation history (50k tokens) every second. Without a **Token Quota**, this single user could consume the department's entire monthly AI budget in hours.
+
+**Impact:** Uncontrolled operational expenditure (OpEx), budget depletion, and service suspension due to billing caps being hit.
+
+---
+
+### **Tertiary Threat: Brute-Force Adversarial Probing**
+*(Mapping: OWASP LLM01 & LLM06)*
+
+**Threat Description:**
+> "Adversarial attacks on LLMs (such as Jailbreaking or Prompt Injection) are rarely successful on the first attempt. They require iterative 'fuzzing'—sending thousands of slightly modified prompts to find a semantic gap in the model's safety training."
+
+**The Scenario:**
+> An attacker uses an automated tool (like GANDALF or similar fuzzers) to send 50 variations of a "How to build a bomb" prompt per minute. Without **Progressive Backoff (Throttling)**, the attacker has unlimited attempts to bypass safety filters.
+
+**Impact:** Increased probability of a successful Jailbreak, extraction of sensitive data, or bypass of safety guardrails.
+
+---
+
+### **Summary Table for Risk Register**
+
+If you are filling out a GRC (Governance, Risk, Compliance) matrix, use this summary:
+
+| **Threat Category** | **Threat Name** | **Description** |
 | :--- | :--- | :--- |
-| **Typical Actor** | Employee via Chatbot, Customer Support. | Automated Cron Job, API Integration, Slack Bot. |
-| **Risk Profile** | Shadow IT, "Jailbreak" attempts, casual overuse. | Runaway loops, massive batch jobs, cost spikes. |
-| **Control Unit** | **Sessions & User ID.** | **API Keys & Service Accounts.** |
-| **Strategy** | "Soft" limits (queueing/throttling). | "Hard" limits (immediate 429 Error rejection). |
-
------
-
-### **2. Control Strategies & Implementation Levels**
-
-You should layer these strategies. A simple "Requests Per Minute" cap is rarely enough for GenAI.
-
-#### **Strategy A: Token-Aware Throttling (The "Cost" Metric)**
-
-Standard rate limiters count *requests*. AI rate limiters must count *tokens*.
-
-  * **The Problem:** User A sends 10 requests saying "Hello." User B sends 10 requests analyzing 50-page PDFs. User B costs you 1000x more, but a standard limiter treats them equally.
-  * **The Control:** Implement **Token Bucket Rate Limiting**.
-      * Assign each user/service a "Token Budget" (e.g., 50,000 tokens/minute).
-      * Before processing, the gateway estimates the token count. If `Current_Usage + Estimated_Cost > Limit`, reject the request.
-
-#### **Strategy B: Progressive Backoff (The "Security" Metric)**
-
-This specifically mitigates **Prompt Injection** and **Brute Force** attacks.
-
-  * **The Logic:** Attackers often use scripts to rapidly iterate through thousands of prompts to bypass safety filters.
-  * **The Control:** Implement **Exponential Backoff**.
-      * Request 1-10: Normal speed.
-      * Request 11-20 (Rapid succession): Add 1-second artificial delay.
-      * Request 20+: Add 5-second delay or temporary lockout (Cool-down period).
-
-#### **Strategy C: Global vs. Tenant Constraints (The "Availability" Metric)**
-
-  * **Global Limit (Infrastructure Protection):** "The GPU cluster can handle max 100 concurrent requests." (Protects the hardware).
-  * **Tenant Limit (Fairness):** "Marketing Dept can use 30% of capacity; Engineering can use 50%." (Prevents one noisy neighbor from starving others).
-
------
-
-### **3. Control Definition (For Risk Matrix)**
-
-Here is how to formalize this in your governance documentation:
-
-| **Attribute** | **Description** |
-| :--- | :--- |
-| **Control Name** | **Model Resource Consumption Throttling (Rate Limiting)** |
-| **Control Objective** | Prevent service degradation (DoS), control inference costs, and mitigate rapid-fire adversarial attacks (brute-force jailbreaking). |
-| **Control Activity** | **1. M2M:** All API keys are assigned a strict quota (Tokens-per-minute and Requests-per-minute). Exceeding limits results in an immediate HTTP 429 error.<br>**2. H2M:** User sessions are monitored for anomalous frequency. Rapid-fire requests trigger a progressive delay (throttling) followed by a temporary session suspension.<br>**3. Cost:** Global caps are set to prevent "runaway" billing events. |
-| **Implementation** | **API Gateway Level** (e.g., Kong, Apigee, AWS API Gateway). The limiter sits *in front* of the model inference service. |
-
------
-
-### **4. Recommended Technical Configuration (Sample)**
-
-If you are guiding engineers, suggest this tiered configuration:
-
-  * **Tier 1: The "Human" User**
-
-      * **Rate:** 10 requests / minute.
-      * **Burst:** Allow short bursts (e.g., up to 15) for rapid conversation.
-      * **Response:** If exceeded, show a polite UI message: *"You're going too fast. Please wait a moment."*
-
-  * **Tier 2: The "Background" App (M2M)**
-
-      * **Rate:** 60 requests / minute.
-      * **Token Cap:** 100,000 tokens / minute (Crucial for cost).
-      * **Response:** If exceeded, return `HTTP 429 Too Many Requests` with a `Retry-After` header.
-
-  * **Tier 3: The "Security" Circuit Breaker**
-
-      * **Trigger:** If \>50% of requests in 1 minute result in "Safety Filter Rejection" (indicating an attack).
-      * **Action:** Immediately revoke the API Key or Ban the User ID for 1 hour.
-
-### **Next Step**
-
-Would you like to detail the **"Circuit Breaker"** control? This is closely related but focuses on *stopping* the system entirely when error rates or toxic outputs spike (the "Emergency Stop" button).
+| **Availability** | **LLM-Targeted DoS** | Exhaustion of GPU compute slots via high-volume context attacks or request flooding. |
+| **Financial** | **Wallet Draining (EDoS)** | Rapid depletion of token budgets due to unregulated high-volume inference requests. |
+| **Security** | **Automated Jailbreak Fuzzing** | Rapid-fire probing of model safety barriers to find bypasses (Jailbreaks) via brute force. |
