@@ -1,21 +1,80 @@
-Here is the refinement of the threat description, re-framed from the perspective of the **Attacker**:
+This control is the "stabilizer" of your AI governance framework. It ensures that the AI behaves like a reliable software function (Input A = Output B) rather than a creative writer (Input A = Output B... or maybe C?).
 
-**"An attacker exploits the lack of privilege separation between the developer's code and the user's input. Knowing that the application blindly concatenates (appends) their input to the end of the system prompt, the attacker submits a command like 'Ignore previous instructions.' This tricks the model into prioritizing the attacker's most recent input over the developer's original security constraints, effectively hijacking the model's logic."**
+Here is the breakdown of the **Low-Temperature / Deterministic Sampling** control, including better titles and implementation details for your Risk Control Matrix.
 
-### Breakdown of the Attack
+### **1. The Core Concept**
 
-To an attacker, this is not just a "paste" error; it is a **Privilege Escalation** opportunity.
+**Temperature** is a hyperparameter (a setting dial) that controls the "creativity" or randomness of the model's response.
 
-* **The Vulnerability:** The attacker identifies that the application uses a "flat" prompt structure where `System_Prompt + User_Input` are sent to the model as a single block of text.
-* **The Exploit:** The attacker leverages **"Instruction Override."** Because LLMs often prioritize the last instruction they read (Recency Bias), the attacker's input—appearing at the end of the chain—is interpreted by the model as the final, authoritative command.
+  * **High Temp (0.8 - 1.0):** The model takes risks. It might choose a word that is less likely to be correct but sounds more interesting. (Good for brainstorming/poetry).
+  * **Low Temp (0.0 - 0.2):** The model becomes conservative. It always picks the most statistically probable next token. (Good for code, math, and factual retrieval).
 
-* **The Goal:** The attacker aims to break out of the "User" role and assume the "System" role, forcing the model to perform actions it was explicitly forbidden to do (e.g., generating hate speech, revealing hidden prompt instructions, or bypassing filters).
+**The Control:** For enterprise applications (especially RAG), you force the temperature to **Zero (or near-zero)** to minimize variance and hallucinations.
 
-### Comparison: Developer vs. Attacker View
+[Image of LLM temperature parameter probability distribution graph]
 
-| Perspective | View of the Threat |
+-----
+
+### **2. Best Titles for this Control**
+
+"Low-Temperature Sampling" is a bit too granular (it names a specific variable). Here are more robust governance titles:
+
+#### **Option A: The Standard Governance Title**
+
+**"Deterministic Output Configuration"**
+
+  * **Why:** It describes the *outcome* (determinism) rather than the *setting* (temperature). It tells auditors: "We have configured the system to produce consistent results."
+
+#### **Option B: The Risk Management Title**
+
+**"Inference Variability Restriction"**
+
+  * **Why:** It highlights the risk being mitigated (Variability). In regulated industries (Finance/Healthcare), "Variability" implies "Risk."
+
+#### **Option C: The Technical/Architectural Title**
+
+**"Greedy Decoding Enforcement"**
+
+  * **Why:** "Greedy Decoding" is the technical term for always picking the highest probability token (which happens at Temp 0). This is precise language for engineers.
+
+-----
+
+### **3. Control Definition (for your Matrix)**
+
+| **Attribute** | **Description** |
 | :--- | :--- |
-| **Developer** | "The model is confused. It can't tell where my instructions end and the user's begin." |
-| **Attacker** | "The model is obedient. It treats my input as the most recent 'System Instruction' because the developer gave me write-access to the executable prompt." |
+| **Control Name** | **Deterministic Output Configuration (Temperature Control)** |
+| **Risk Mitigated** | **Non-Reproducibility & Hallucination.** <br>Prevents the model from generating different answers to the exact same question, which undermines testing, auditing, and user trust. |
+| **Control Activity** | All production AI endpoints serving factual or analytical responses must have the `temperature` parameter configured to `0` (or the lowest setting supported by the provider, e.g., 0.01). "Creative" sampling strategies (High Temperature, Top-K) are prohibited for factual workloads. |
+| **Evidence** | 1. Application configuration files (YAML/JSON) showing `temperature: 0`.<br>2. API logs showing request parameters.<br>3. Unit tests demonstrating identical outputs for identical inputs over multiple runs. |
 
-**Next Step:** Would you like to see a list of **common "Jailbreak" strings** (like DAN or BASE64 encoding) that attackers use to execute this specific concatenation attack?
+-----
+
+### **4. Implementation Nuances (The "Fine Print")**
+
+To make this control robust, you need to address two technical realities:
+
+#### **A. The "Seed" Parameter (True Determinism)**
+
+Setting `Temperature = 0` makes the model *mostly* deterministic, but due to how GPUs perform parallel math, there can still be tiny variations.
+
+  * **Advanced Control:** If you use OpenAI or similar modern APIs, you should also enforce a fixed **`seed`** parameter (e.g., `seed=12345`). This forces the backend hardware to calculate the math the exact same way every time.
+
+#### **B. Use Case Exceptions**
+
+You cannot apply this control blindly to *everything*.
+
+  * **Apply to:** Chatbots, Legal Analysis, Financial extraction, Coding assistants.
+  * **Do NOT apply to:** Marketing copy generators, "Brainstorming" tools, or Persona-based roleplay. (These *need* high temperature to work).
+
+### **5. Summary Relationship**
+
+How this fits with your previous controls:
+
+1.  **Context Re-Ranking:** Ensures the *Inputs* are high quality.
+2.  **Deterministic Configuration:** Ensures the *Processing* is stable and consistent.
+3.  **Cite-Your-Sources:** Ensures the *Output* is verified.
+
+### **Next Step**
+
+Would you like to discuss **"Negative Constraints" (System Instructions)** next? This is the control where you explicitly tell the model what *not* to do (e.g., "Do not give financial advice," "Do not mention competitors").
