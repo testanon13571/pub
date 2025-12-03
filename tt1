@@ -1,80 +1,90 @@
-This control is the "stabilizer" of your AI governance framework. It ensures that the AI behaves like a reliable software function (Input A = Output B) rather than a creative writer (Input A = Output B... or maybe C?).
+### **Control Name:** Model Resource Consumption & Traffic Throttling (Rate Limiting)
 
-Here is the breakdown of the **Low-Temperature / Deterministic Sampling** control, including better titles and implementation details for your Risk Control Matrix.
+In the world of AI, Rate Limiting is not just about preventing DoS attacks (Availability); it is a critical **Financial Control** (Cost Management) and a **Security Control** (Anti-Brute Force).
 
-### **1. The Core Concept**
+Because LLM inference is computationally expensive and billed by the "token," standard HTTP rate limiting (requests per second) is often insufficient. You must implement strategies that account for the **complexity** of the request, not just the count.
 
-**Temperature** is a hyperparameter (a setting dial) that controls the "creativity" or randomness of the model's response.
-
-  * **High Temp (0.8 - 1.0):** The model takes risks. It might choose a word that is less likely to be correct but sounds more interesting. (Good for brainstorming/poetry).
-  * **Low Temp (0.0 - 0.2):** The model becomes conservative. It always picks the most statistically probable next token. (Good for code, math, and factual retrieval).
-
-**The Control:** For enterprise applications (especially RAG), you force the temperature to **Zero (or near-zero)** to minimize variance and hallucinations.
-
-[Image of LLM temperature parameter probability distribution graph]
+[Image of API Gateway rate limiting architecture diagram]
 
 -----
 
-### **2. Best Titles for this Control**
+### **1. The Core Differentiator: Human vs. Machine**
 
-"Low-Temperature Sampling" is a bit too granular (it names a specific variable). Here are more robust governance titles:
+The control must apply different logic depending on the actor.
 
-#### **Option A: The Standard Governance Title**
-
-**"Deterministic Output Configuration"**
-
-  * **Why:** It describes the *outcome* (determinism) rather than the *setting* (temperature). It tells auditors: "We have configured the system to produce consistent results."
-
-#### **Option B: The Risk Management Title**
-
-**"Inference Variability Restriction"**
-
-  * **Why:** It highlights the risk being mitigated (Variability). In regulated industries (Finance/Healthcare), "Variability" implies "Risk."
-
-#### **Option C: The Technical/Architectural Title**
-
-**"Greedy Decoding Enforcement"**
-
-  * **Why:** "Greedy Decoding" is the technical term for always picking the highest probability token (which happens at Temp 0). This is precise language for engineers.
+| Feature | **Human-to-Machine (H2M)** | **Machine-to-Machine (M2M)** |
+| :--- | :--- | :--- |
+| **Typical Actor** | Employee via Chatbot, Customer Support. | Automated Cron Job, API Integration, Slack Bot. |
+| **Risk Profile** | Shadow IT, "Jailbreak" attempts, casual overuse. | Runaway loops, massive batch jobs, cost spikes. |
+| **Control Unit** | **Sessions & User ID.** | **API Keys & Service Accounts.** |
+| **Strategy** | "Soft" limits (queueing/throttling). | "Hard" limits (immediate 429 Error rejection). |
 
 -----
 
-### **3. Control Definition (for your Matrix)**
+### **2. Control Strategies & Implementation Levels**
+
+You should layer these strategies. A simple "Requests Per Minute" cap is rarely enough for GenAI.
+
+#### **Strategy A: Token-Aware Throttling (The "Cost" Metric)**
+
+Standard rate limiters count *requests*. AI rate limiters must count *tokens*.
+
+  * **The Problem:** User A sends 10 requests saying "Hello." User B sends 10 requests analyzing 50-page PDFs. User B costs you 1000x more, but a standard limiter treats them equally.
+  * **The Control:** Implement **Token Bucket Rate Limiting**.
+      * Assign each user/service a "Token Budget" (e.g., 50,000 tokens/minute).
+      * Before processing, the gateway estimates the token count. If `Current_Usage + Estimated_Cost > Limit`, reject the request.
+
+#### **Strategy B: Progressive Backoff (The "Security" Metric)**
+
+This specifically mitigates **Prompt Injection** and **Brute Force** attacks.
+
+  * **The Logic:** Attackers often use scripts to rapidly iterate through thousands of prompts to bypass safety filters.
+  * **The Control:** Implement **Exponential Backoff**.
+      * Request 1-10: Normal speed.
+      * Request 11-20 (Rapid succession): Add 1-second artificial delay.
+      * Request 20+: Add 5-second delay or temporary lockout (Cool-down period).
+
+#### **Strategy C: Global vs. Tenant Constraints (The "Availability" Metric)**
+
+  * **Global Limit (Infrastructure Protection):** "The GPU cluster can handle max 100 concurrent requests." (Protects the hardware).
+  * **Tenant Limit (Fairness):** "Marketing Dept can use 30% of capacity; Engineering can use 50%." (Prevents one noisy neighbor from starving others).
+
+-----
+
+### **3. Control Definition (For Risk Matrix)**
+
+Here is how to formalize this in your governance documentation:
 
 | **Attribute** | **Description** |
 | :--- | :--- |
-| **Control Name** | **Deterministic Output Configuration (Temperature Control)** |
-| **Risk Mitigated** | **Non-Reproducibility & Hallucination.** <br>Prevents the model from generating different answers to the exact same question, which undermines testing, auditing, and user trust. |
-| **Control Activity** | All production AI endpoints serving factual or analytical responses must have the `temperature` parameter configured to `0` (or the lowest setting supported by the provider, e.g., 0.01). "Creative" sampling strategies (High Temperature, Top-K) are prohibited for factual workloads. |
-| **Evidence** | 1. Application configuration files (YAML/JSON) showing `temperature: 0`.<br>2. API logs showing request parameters.<br>3. Unit tests demonstrating identical outputs for identical inputs over multiple runs. |
+| **Control Name** | **Model Resource Consumption Throttling (Rate Limiting)** |
+| **Control Objective** | Prevent service degradation (DoS), control inference costs, and mitigate rapid-fire adversarial attacks (brute-force jailbreaking). |
+| **Control Activity** | **1. M2M:** All API keys are assigned a strict quota (Tokens-per-minute and Requests-per-minute). Exceeding limits results in an immediate HTTP 429 error.<br>**2. H2M:** User sessions are monitored for anomalous frequency. Rapid-fire requests trigger a progressive delay (throttling) followed by a temporary session suspension.<br>**3. Cost:** Global caps are set to prevent "runaway" billing events. |
+| **Implementation** | **API Gateway Level** (e.g., Kong, Apigee, AWS API Gateway). The limiter sits *in front* of the model inference service. |
 
 -----
 
-### **4. Implementation Nuances (The "Fine Print")**
+### **4. Recommended Technical Configuration (Sample)**
 
-To make this control robust, you need to address two technical realities:
+If you are guiding engineers, suggest this tiered configuration:
 
-#### **A. The "Seed" Parameter (True Determinism)**
+  * **Tier 1: The "Human" User**
 
-Setting `Temperature = 0` makes the model *mostly* deterministic, but due to how GPUs perform parallel math, there can still be tiny variations.
+      * **Rate:** 10 requests / minute.
+      * **Burst:** Allow short bursts (e.g., up to 15) for rapid conversation.
+      * **Response:** If exceeded, show a polite UI message: *"You're going too fast. Please wait a moment."*
 
-  * **Advanced Control:** If you use OpenAI or similar modern APIs, you should also enforce a fixed **`seed`** parameter (e.g., `seed=12345`). This forces the backend hardware to calculate the math the exact same way every time.
+  * **Tier 2: The "Background" App (M2M)**
 
-#### **B. Use Case Exceptions**
+      * **Rate:** 60 requests / minute.
+      * **Token Cap:** 100,000 tokens / minute (Crucial for cost).
+      * **Response:** If exceeded, return `HTTP 429 Too Many Requests` with a `Retry-After` header.
 
-You cannot apply this control blindly to *everything*.
+  * **Tier 3: The "Security" Circuit Breaker**
 
-  * **Apply to:** Chatbots, Legal Analysis, Financial extraction, Coding assistants.
-  * **Do NOT apply to:** Marketing copy generators, "Brainstorming" tools, or Persona-based roleplay. (These *need* high temperature to work).
-
-### **5. Summary Relationship**
-
-How this fits with your previous controls:
-
-1.  **Context Re-Ranking:** Ensures the *Inputs* are high quality.
-2.  **Deterministic Configuration:** Ensures the *Processing* is stable and consistent.
-3.  **Cite-Your-Sources:** Ensures the *Output* is verified.
+      * **Trigger:** If \>50% of requests in 1 minute result in "Safety Filter Rejection" (indicating an attack).
+      * **Action:** Immediately revoke the API Key or Ban the User ID for 1 hour.
 
 ### **Next Step**
 
-Would you like to discuss **"Negative Constraints" (System Instructions)** next? This is the control where you explicitly tell the model what *not* to do (e.g., "Do not give financial advice," "Do not mention competitors").
+Would you like to detail the **"Circuit Breaker"** control? This is closely related but focuses on *stopping* the system entirely when error rates or toxic outputs spike (the "Emergency Stop" button).
