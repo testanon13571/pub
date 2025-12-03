@@ -1,54 +1,5 @@
-To properly justify the "Dual-Layer Throttling" control in a Risk Register or Threat Model, you need to articulate the specific adverse events that occur if the control is absent.
-
-Here is the formulated threat description, categorized by **Availability**, **Financial**, and **Security** impacts.
-
-### **Primary Threat: Model Denial of Service (DoS) & Resource Exhaustion**
-*(Mapping: OWASP LLM04)*
-
-**Threat Description:**
-> "Without granular throttling and volume limits, an attacker—or a misconfigured internal script—can overwhelm the Limited Inference Capacity of the LLM infrastructure. Unlike standard web servers, LLM inference is computationally heavy (GPU-bound). A relatively low number of high-volume requests (e.g., massive context inputs or maximum token generation requests) can occupy all available GPU slots."
-
-**The Attack Vectors:**
-1.  **The "Context Expansion" Attack (Volume):** An attacker sends requests containing maximum-length nonsense text (e.g., repeating a word 10,000 times) to force the model to process the full context window, causing extreme latency spikes for all other users.
-2.  **The "Generation Loop" Attack (Compute):** An attacker prompts the model to 'count to infinity' or generate infinite code loops, forcing the GPU to work until it hits a hard timeout.
-3.  **The "Retry Storm" (Frequency):** A legitimate internal application fails and enters a rapid retry loop, accidentally flooding the model API.
-
-**Impact:** System outage, extreme latency (seconds becomes minutes), and blocking of legitimate business traffic.
-
----
-
-### **Secondary Threat: Economic / Wallet Denial of Service (EDoS)**
-*(Mapping: Financial Risk)*
-
-**Threat Description:**
-> "LLM providers (OpenAI, Anthropic, Vertex AI) and internal GPU clusters bill based on **token consumption**, not just request count. A malicious actor or a negligent user can engage in 'Resource Burning' by repeatedly triggering high-cost tasks (e.g., analyzing 100-page PDFs) without exceeding standard request-based rate limits."
-
-**The Scenario:**
-> A user connects a script to the chatbot API that re-sends the entire conversation history (50k tokens) every second. Without a **Token Quota**, this single user could consume the department's entire monthly AI budget in hours.
-
-**Impact:** Uncontrolled operational expenditure (OpEx), budget depletion, and service suspension due to billing caps being hit.
-
----
-
-### **Tertiary Threat: Brute-Force Adversarial Probing**
-*(Mapping: OWASP LLM01 & LLM06)*
-
-**Threat Description:**
-> "Adversarial attacks on LLMs (such as Jailbreaking or Prompt Injection) are rarely successful on the first attempt. They require iterative 'fuzzing'—sending thousands of slightly modified prompts to find a semantic gap in the model's safety training."
-
-**The Scenario:**
-> An attacker uses an automated tool (like GANDALF or similar fuzzers) to send 50 variations of a "How to build a bomb" prompt per minute. Without **Progressive Backoff (Throttling)**, the attacker has unlimited attempts to bypass safety filters.
-
-**Impact:** Increased probability of a successful Jailbreak, extraction of sensitive data, or bypass of safety guardrails.
-
----
-
-### **Summary Table for Risk Register**
-
-If you are filling out a GRC (Governance, Risk, Compliance) matrix, use this summary:
-
-| **Threat Category** | **Threat Name** | **Description** |
-| :--- | :--- | :--- |
-| **Availability** | **LLM-Targeted DoS** | Exhaustion of GPU compute slots via high-volume context attacks or request flooding. |
-| **Financial** | **Wallet Draining (EDoS)** | Rapid depletion of token budgets due to unregulated high-volume inference requests. |
-| **Security** | **Automated Jailbreak Fuzzing** | Rapid-fire probing of model safety barriers to find bypasses (Jailbreaks) via brute force. |
+Attribute,Definition
+Control Name,System Instruction Integrity & Output Sanitization
+Control ID,AIC-07 (Example)
+Risk Domain,Confidentiality (Info Disclosure)
+Description,"The AI system must implement controls to prevent the disclosure of its underlying System Instructions (Meta-Prompts). This includes: 1. Instruction Hardening: Explicit directives in the system prompt forbidding self-disclosure.2. Refusal Standardization: Configuring the model to output generic, opaque refusal messages (e.g., ""I cannot answer this"") rather than detailed explanations of security logic.3. Leakage Filtering: Automated scanning of output text to detect and block the display of internal prompt identifiers or ""Canary"" tokens."
