@@ -1,4 +1,79 @@
-Control ID,Control Name,Implementation Specification (G-SIB Standard)
-ING-01,Strict Magic Byte Verification (Not Extension),"Do not rely on .pdf or .png extensions. Use a library like libmagic to inspect the file header (Magic Bytes) to confirm the true file type. Action: If Header != Extension, immediately quarantine and flag as Security Incident: Evasion Attempt."
-ING-02,Sandboxed Content Disarm & Reconstruction (CDR),"Never process raw files directly in the embedding worker. 1. Explode: Convert complex formats (PDF/Docx) into flat intermediate formats (e.g., render PDF pages to high-res PNGs). 2. Sanitize: Strip all active content (Macros, JavaScript, embedded binaries, OLE objects). 3. Reconstruct: Re-assemble into a clean, text-only or flattened PDF for OCR. This neutralizes the ""shell script in a header"" attack."
-ING-03,Adversarial Image Washing (Gaussian Filtering),To mitigate Multimodal Backdoors (pixel noise triggers): Apply a lightweight lossy transformation to all input images before they hit the model (Qwen-VL). Recipe: Resize to 95% -> Re-scale to 100% -> Apply mild Gaussian Blur (sigma=0.5) -> Re-encode as JPEG (Quality 90). This destroys the fragile high-frequency noise used in adversarial triggers without hurting human/AI legibility.
+Here is the data flow for your **Classic RAG (Vector-First)** architecture, explicitly mapped to your defined on-premise technology stack (**OpenTrek, pgvector, Redis, Isilon**).
+
+This flow illustrates the "Happy Path" where a user asks a question, and the system retrieves answers using vector similarity.
+
+### The Architecture Diagram
+
+```mermaid
+graph TD
+    %% Users and Entry
+    User([Bank Employee]) -->|1. Query| Gateway[Alibaba OpenTrek\n(Orchestration & Security Layer)]
+
+    %% Caching Layer
+    Gateway -->|2. Check Cache| Redis[(Redis\nCache)]
+    Redis -.->|Hit: Return Cached Answer| Gateway
+    Redis -.->|Miss: Proceed| Gateway
+
+    %% Vectorization (Inference)
+    subgraph "Inference & Embedding"
+        Gateway -->|3. Send Query| EmbedModel[Embedding Model\n(Frozen)]
+        EmbedModel -->|4. Return Vector| Gateway
+    end
+
+    %% Retrieval Layer
+    subgraph "Knowledge Retrieval"
+        Gateway -->|5. Similarity Search\n(Query Vector)| PgVector[(pgvector\nPostgreSQL)]
+        PgVector -->|6. Return Top-K Chunks\n+ Metadata| Gateway
+        
+        %% Optional: Fetch full text if not in vector DB
+        Gateway -.->|7. Fetch Raw Content\n(If needed)| Isilon[(Dell Isilon\nSource Docs)]
+    end
+
+    %% Generation Layer
+    subgraph "Generation (LLM)"
+        Gateway -->|8. Construct Prompt\n(System Prompt + Context + Query)| LLM[LLM Inference\n(Qwen / Frozen)]
+        LLM -->|9. Generate Response| Gateway
+    end
+
+    %% Final Output
+    Gateway -->|10. Final Answer| User
+```
+
+-----
+
+### Step-by-Step Data Flow Description
+
+#### Phase 1: Request & Caching (The "Speed" Layer)
+
+  * **Step 1 (Input):** The user submits a query (e.g., *"What is the counterparty risk policy for Class A derivatives?"*) to the **Alibaba OpenTrek** API Gateway.
+      * *Security Note:* This is where input sanitization (PII redaction/Injection checks) happens.
+  * **Step 2 (Cache Check):** OpenTrek hashes the query and checks **Redis**.
+      * **Hit:** If this exact question was asked recently, **Redis** returns the stored answer immediately (saving GPU costs).
+      * **Miss:** The system proceeds to the retrieval pipeline.
+
+#### Phase 2: Vector Retrieval (The "Search" Layer)
+
+  * **Step 3 (Vectorization):** OpenTrek sends the raw text query to the **Embedding Model** (hosted within the OpenTrek runtime).
+  * **Step 4 (Embedding):** The model converts the text into a numerical vector (e.g., a 1536-dimensional float array).
+  * **Step 5 (Search):** OpenTrek sends this vector to **pgvector** (PostgreSQL). It performs an Approximate Nearest Neighbor (ANN) search (e.g., using HNSW or IVFFlat indexes) to find the most similar document chunks.
+  * **Step 6 (Retrieval):** **pgvector** returns the "Top-K" chunks (e.g., the 5 most relevant paragraphs) along with their metadata (page number, document source).
+      * *Note on Elasticsearch:* While your stack includes Elasticsearch, a *classic vector RAG* relies primarily on `pgvector` here. Elasticsearch would typically be used only if you needed keyword-specific filtering (e.g., "Find vectors ONLY in documents dated 2024").
+
+#### Phase 3: Generation (The "Intelligence" Layer)
+
+  * **Step 8 (Prompt Assembly):** OpenTrek acts as the "Chef." It combines three ingredients into a single text block:
+    1.  **System Prompt:** *"You are a helpful banking assistant..."* (The immutable safety rules).
+    2.  **Context:** The text chunks retrieved from **pgvector**.
+    3.  **User Query:** The original question.
+  * **Step 9 (Inference):** This massive block of text is sent to the **LLM (e.g., Qwen)**. The LLM reads the retrieved context and generates an answer rooted in that data.
+  * **Step 10 (Response):** The answer is streamed back to the user via OpenTrek.
+      * *Post-Processing:* The answer is simultaneously saved to **Redis** to speed up future requests.
+
+### Key Component Roles Summary
+
+| Component | Role in RAG Flow |
+| :--- | :--- |
+| **Alibaba OpenTrek** | **The Brain.** Orchestrates the flow, calls models, manages the prompt construction, and enforces security. |
+| **Redis** | **The Accelerator.** Stores "Question -\> Answer" pairs to reduce latency. |
+| **pgvector** | **The Index.** Stores the mathematical representation of your bank's knowledge. Performs the actual "search." |
+| **Dell Isilon** | **The Library.** Stores the original "Gold Copy" PDF/Docx files. If `pgvector` only stores vectors, OpenTrek fetches the actual readable text from here (or a text cache) to show the user. |
