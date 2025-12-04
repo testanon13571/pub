@@ -1,15 +1,23 @@
-Here is the **Risk-Adaptive Security Standard for Elasticsearch Multi-Tenancy**, formatted as a formal policy prescription for your Architecture Decision Document.
+Here is the **concise, executive-summary version** of the Security Control. This is streamlined for high-level documentation or presentation slides.
 
-### **Security Standard: Risk-Adaptive Multi-Tenancy for AI Knowledge Bases**
+***
 
-**Policy Statement**
-To balance the rigorous data sovereignty requirements of a Global Systemically Important Bank (G-SIB) with the operational scalability of the AI infrastructure, the Platform shall enforce a **Risk-Adaptive Tiered Isolation Model** for all vector and full-text search indices. This model mandates that the technical isolation mechanism applied to a dataset must be commensurate with its Data Confidentiality Classification. A "one-size-fits-all" approach is explicitly prohibited; instead, strict physical segmentation is reserved for high-risk data, while logical segmentation allows for efficient scaling of standard banking operations.
+### **Security Control: Risk-Based Data Isolation**
 
-**Prescription for Tier 1: High Assurance Physical Isolation ("The Vault")**
-All AI use cases involving **Material Non-Public Information (MNPI)**, Restricted Access High-Value datasets (e.g., M&A Strategy, Ultra-High-Net-Worth Client Data), or data requiring legal cryptographic erasure **MUST** utilize **Physical Index Isolation**. In this configuration, each tenant or project is provisioned a dedicated, air-gapped Elasticsearch index (e.g., `idx-restricted-project_omega-v1`). This architecture ensures that sensitive data physically resides in distinct Lucene segments, governed by unique encryption keys where supported. Access control is strictly enforced at the index level, ensuring that even a catastrophic failure of application-layer logic cannot expose these datasets to unauthorized lines of business. To maintain cluster stability, these restricted indices must be configured via Index Templates to utilize minimal primary shards (default: 1) unless data volume explicitly necessitates scaling.
+**Policy:**
+The AI Platform enforces a **Two-Tier Isolation Model** for search indices. Data residency is determined strictly by the data’s sensitivity classification.
 
-**Prescription for Tier 2: Logical Isolation with DLS ("The Open Floor")**
-For standard **Internal, Confidential, or Public** datasets (e.g., General Banking Policies, IT Documentation, Code Repositories), the Platform **SHALL** utilize **Logical Isolation** within shared, division-level indices to maximize infrastructure efficiency. Data from multiple projects may coexist within a shared index (e.g., `idx-retail-common`), provided that **Document Level Security (DLS)** is strictly enforced by the API Gateway and Database Kernel. Every document ingested into this tier **MUST** be tagged with a mandatory, immutable `tenant_id` or `access_group` metadata field. The Search Gateway is required to intercept every query targeting this tier and append a mandatory filter clause effectively blinding the user to any documents outside their authorized context. This tier balances security with the operational necessity of hosting thousands of smaller datasets without incurring the performance penalty of "Shard Bloat."
+**1. Tier 1: Physical Isolation ("The Vault")**
+* **Applicability:** **Restricted / MNPI / Secret** (e.g., M&A, Private Wealth).
+* **Control:** Dedicated, air-gapped index per project.
+* **Requirement:** Must use separate encryption keys and allow for cryptographic deletion (crypto-shredding) upon project closure.
+* **Access:** Strictly limited to the specific project's service account.
 
-**Governance & Implementation**
-The provisioning of these tiers is governed by the principle of **"Logical by Default, Physical by Exception."** All new AI projects shall be automatically provisioned into Tier 2 (Logical Isolation) to preserve cluster resources. Elevation to Tier 1 (Physical Isolation) requires an explicit attestation of MNPI or regulatory data residency requirements during the onboarding process. This decision logic must be codified in the Infrastructure-as-Code (IaC) pipelines, ensuring that the selection of the isolation model is deterministic, auditable, and immutable after deployment.
+**2. Tier 2: Logical Isolation ("The Warehouse")**
+* **Applicability:** **Confidential / Internal / Public** (e.g., General Banking, IT, HR).
+* **Control:** Shared indices segmented by Division (e.g., Retail, Commercial).
+* **Requirement:** Access is enforced via **Document-Level Security (DLS)** tags. Every query must include mandatory filter clauses to restrict view access.
+* **Access:** Shared infrastructure, logically partitioned by user role.
+
+**Default Rule:**
+All new projects default to **Tier 2 (Logical)** to preserve infrastructure resources. Elevation to **Tier 1 (Physical)** requires explicit validation of High-Risk/MNPI status.
