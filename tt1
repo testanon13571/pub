@@ -1,23 +1,36 @@
-Here is the **concise, executive-summary version** of the Security Control. This is streamlined for high-level documentation or presentation slides.
+### Step-by-Step Data Flow Description
 
-***
+#### Phase 1: Request & Caching (The "Speed" Layer)
 
-### **Security Control: Risk-Based Data Isolation**
+  * **Step 1 (Input):** The user submits a query (e.g., *"What is the counterparty risk policy for Class A derivatives?"*) to the **Alibaba OpenTrek** API Gateway.
+      * *Security Note:* This is where input sanitization (PII redaction/Injection checks) happens.
+  * **Step 2 (Cache Check):** OpenTrek hashes the query and checks **Redis**.
+      * **Hit:** If this exact question was asked recently, **Redis** returns the stored answer immediately (saving GPU costs).
+      * **Miss:** The system proceeds to the retrieval pipeline.
 
-**Policy:**
-The AI Platform enforces a **Two-Tier Isolation Model** for search indices. Data residency is determined strictly by the data’s sensitivity classification.
+#### Phase 2: Vector Retrieval (The "Search" Layer)
 
-**1. Tier 1: Physical Isolation ("The Vault")**
-* **Applicability:** **Restricted / MNPI / Secret** (e.g., M&A, Private Wealth).
-* **Control:** Dedicated, air-gapped index per project.
-* **Requirement:** Must use separate encryption keys and allow for cryptographic deletion (crypto-shredding) upon project closure.
-* **Access:** Strictly limited to the specific project's service account.
+  * **Step 3 (Vectorization):** OpenTrek sends the raw text query to the **Embedding Model** (hosted within the OpenTrek runtime).
+  * **Step 4 (Embedding):** The model converts the text into a numerical vector (e.g., a 1536-dimensional float array).
+  * **Step 5 (Search):** OpenTrek sends this vector to **pgvector** (PostgreSQL). It performs an Approximate Nearest Neighbor (ANN) search (e.g., using HNSW or IVFFlat indexes) to find the most similar document chunks.
+  * **Step 6 (Retrieval):** **pgvector** returns the "Top-K" chunks (e.g., the 5 most relevant paragraphs) along with their metadata (page number, document source).
+      * *Note on Elasticsearch:* While your stack includes Elasticsearch, a *classic vector RAG* relies primarily on `pgvector` here. Elasticsearch would typically be used only if you needed keyword-specific filtering (e.g., "Find vectors ONLY in documents dated 2024").
 
-**2. Tier 2: Logical Isolation ("The Warehouse")**
-* **Applicability:** **Confidential / Internal / Public** (e.g., General Banking, IT, HR).
-* **Control:** Shared indices segmented by Division (e.g., Retail, Commercial).
-* **Requirement:** Access is enforced via **Document-Level Security (DLS)** tags. Every query must include mandatory filter clauses to restrict view access.
-* **Access:** Shared infrastructure, logically partitioned by user role.
+#### Phase 3: Generation (The "Intelligence" Layer)
 
-**Default Rule:**
-All new projects default to **Tier 2 (Logical)** to preserve infrastructure resources. Elevation to **Tier 1 (Physical)** requires explicit validation of High-Risk/MNPI status.
+  * **Step 8 (Prompt Assembly):** OpenTrek acts as the "Chef." It combines three ingredients into a single text block:
+    1.  **System Prompt:** *"You are a helpful banking assistant..."* (The immutable safety rules).
+    2.  **Context:** The text chunks retrieved from **pgvector**.
+    3.  **User Query:** The original question.
+  * **Step 9 (Inference):** This massive block of text is sent to the **LLM (e.g., Qwen)**. The LLM reads the retrieved context and generates an answer rooted in that data.
+  * **Step 10 (Response):** The answer is streamed back to the user via OpenTrek.
+      * *Post-Processing:* The answer is simultaneously saved to **Redis** to speed up future requests.
+
+### Key Component Roles Summary
+
+| Component | Role in RAG Flow |
+| :--- | :--- |
+| **Alibaba OpenTrek** | **The Brain.** Orchestrates the flow, calls models, manages the prompt construction, and enforces security. |
+| **Redis** | **The Accelerator.** Stores "Question -\> Answer" pairs to reduce latency. |
+| **pgvector** | **The Index.** Stores the mathematical representation of your bank's knowledge. Performs the actual "search." |
+| **Dell Isilon** | **The Library.** Stores the original "Gold Copy" PDF/Docx files. If `pgvector` only stores vectors, OpenTrek fetches the actual readable text from here (or a text cache) to show the user. |
