@@ -1,36 +1,15 @@
-### Step-by-Step Data Flow Description
+A. For Dell Isilon (Object & File Storage)
+A.1 Model Artifacts & Weights: For AI Model binaries (e.g., .safetensors, .bin), Storage-Level Encryption (SEDs/Data-at-Rest) via FIPS-validated Self-Encrypting Drives is REQUIRED and SUFFICIENT.
 
-#### Phase 1: Request & Caching (The "Speed" Layer)
+Constraint: Application-Level Encryption is explicitly discouraged for model weights greater than 1GB to prevent inference latency and "Cold Start" timeouts.
 
-  * **Step 1 (Input):** The user submits a query (e.g., *"What is the counterparty risk policy for Class A derivatives?"*) to the **Alibaba OpenTrek** API Gateway.
-      * *Security Note:* This is where input sanitization (PII redaction/Injection checks) happens.
-  * **Step 2 (Cache Check):** OpenTrek hashes the query and checks **Redis**.
-      * **Hit:** If this exact question was asked recently, **Redis** returns the stored answer immediately (saving GPU costs).
-      * **Miss:** The system proceeds to the retrieval pipeline.
+A.2 RAG Knowledge Base & Sensitive Documents: For unstructured documents (PDFs, Contracts) containing PII/MNPI, Application-Level (Client-Side) Encryption is MANDATORY.
 
-#### Phase 2: Vector Retrieval (The "Search" Layer)
+Constraint: The AI Platform must hold the encryption keys, ensuring that storage administrators cannot view the raw content. This enables granular "Crypto-Shredding" for Right-to-Erasure requests.
 
-  * **Step 3 (Vectorization):** OpenTrek sends the raw text query to the **Embedding Model** (hosted within the OpenTrek runtime).
-  * **Step 4 (Embedding):** The model converts the text into a numerical vector (e.g., a 1536-dimensional float array).
-  * **Step 5 (Search):** OpenTrek sends this vector to **pgvector** (PostgreSQL). It performs an Approximate Nearest Neighbor (ANN) search (e.g., using HNSW or IVFFlat indexes) to find the most similar document chunks.
-  * **Step 6 (Retrieval):** **pgvector** returns the "Top-K" chunks (e.g., the 5 most relevant paragraphs) along with their metadata (page number, document source).
-      * *Note on Elasticsearch:* While your stack includes Elasticsearch, a *classic vector RAG* relies primarily on `pgvector` here. Elasticsearch would typically be used only if you needed keyword-specific filtering (e.g., "Find vectors ONLY in documents dated 2024").
+B. For AI Databases (pgvector, Elasticsearch, Redis)
+B.1 Vector & Search Indices: To maintain mathematical search capabilities (e.g., Cosine Similarity), Infrastructure/Volume-Level Encryption (e.g., LUKS, dm-crypt) is MANDATORY for all underlying data and swap partitions.
 
-#### Phase 3: Generation (The "Intelligence" Layer)
+Constraint: Column-Level/Application-Level Encryption MUST NOT be applied to vector embedding columns, as this renders the data unsearchable.
 
-  * **Step 8 (Prompt Assembly):** OpenTrek acts as the "Chef." It combines three ingredients into a single text block:
-    1.  **System Prompt:** *"You are a helpful banking assistant..."* (The immutable safety rules).
-    2.  **Context:** The text chunks retrieved from **pgvector**.
-    3.  **User Query:** The original question.
-  * **Step 9 (Inference):** This massive block of text is sent to the **LLM (e.g., Qwen)**. The LLM reads the retrieved context and generates an answer rooted in that data.
-  * **Step 10 (Response):** The answer is streamed back to the user via OpenTrek.
-      * *Post-Processing:* The answer is simultaneously saved to **Redis** to speed up future requests.
-
-### Key Component Roles Summary
-
-| Component | Role in RAG Flow |
-| :--- | :--- |
-| **Alibaba OpenTrek** | **The Brain.** Orchestrates the flow, calls models, manages the prompt construction, and enforces security. |
-| **Redis** | **The Accelerator.** Stores "Question -\> Answer" pairs to reduce latency. |
-| **pgvector** | **The Index.** Stores the mathematical representation of your bank's knowledge. Performs the actual "search." |
-| **Dell Isilon** | **The Library.** Stores the original "Gold Copy" PDF/Docx files. If `pgvector` only stores vectors, OpenTrek fetches the actual readable text from here (or a text cache) to show the user. |
+B.2 Sensitive Text Payloads: For database columns storing the raw readable text associated with a vector (e.g., the content field), Application-Level Encryption or Tokenization (Control C) SHOULD be applied where operationally feasible.
